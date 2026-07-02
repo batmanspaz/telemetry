@@ -20,3 +20,11 @@ jobs:
         run: pnpm run typecheck
       - name: Test
         run: pnpm test
+      - name: Verify dist/ is committed and up to date
+        # dist/ is checked in (not gitignored) so tarball/git-URL installs — which
+        # don't run the `prepare` lifecycle script — always get built output.
+        # Fails loud if src/ changed without rebuilding dist/, instead of silently
+        # shipping stale output to every consumer.
+        run: |
+          pnpm run build
+          git diff --exit-code -- dist/
