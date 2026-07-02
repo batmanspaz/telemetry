@@ -89,16 +89,11 @@ export interface Telemetry {
   stop(): void;
 }
 
-interface BufferedEvent {
-  event: AnalyticsEvent;
-  key: string;
-}
-
-/** Stable dedupe key derived from event content. */
-function deriveKey(event: AnalyticsEvent): string {
-  const propKeys = Object.keys(event.props).sort();
-  const canonicalProps = propKeys.map((k) => `${k}=${String(event.props[k])}`).join('&');
-  return hash([event.event, event.entity_id ?? '', event.ts, canonicalProps].join('|'));
+/** Stable dedupe key derived from event content (used when the caller omits `key`). */
+function deriveKey(event: string, entityId: string | undefined, ts: string, props: Record<string, PropValue>): string {
+  const propKeys = Object.keys(props).sort();
+  const canonicalProps = propKeys.map((k) => `${k}=${String(props[k])}`).join('&');
+  return hash([event, entityId ?? '', ts, canonicalProps].join('|'));
 }
 
 export function createTelemetry(config: TelemetryConfig): Telemetry {
@@ -123,7 +118,9 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   let lastInput: HealthInput | null = null;
   let lastSentStatus: HealthStatus | null = null;
 
-  const buffer: BufferedEvent[] = [];
+  // Buffer holds fully-validated AnalyticsEvent objects (each already carries its
+  // own dedupe_key) — the wire body is this array, verbatim, with no envelope.
+  const buffer: AnalyticsEvent[] = [];
   const seenKeys = new Set<string>();
 
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -199,6 +196,10 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   function track(input: TrackInput): void {
     try {
       counters.events_tracked++;
+      const ts = input.ts ?? isoNow();
+      const props = input.props ?? {};
+      const dedupeKey = input.key ?? deriveKey(input.event, input.entity_id, ts, props);
+
       const candidate = {
         schema_version: SCHEMA_VERSION,
         event: input.event,
@@ -208,8 +209,9 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
         entity_id: input.entity_id,
         actor: input.actor,
         session_id: input.session_id,
-        props: input.props ?? {},
-        ts: input.ts ?? isoNow(),
+        props,
+        ts,
+        dedupe_key: dedupeKey,
       };
 
       const parsed = AnalyticsEventSchema.safeParse(candidate);
@@ -225,13 +227,12 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
         return;
       }
 
-      const key = input.key ?? deriveKey(event);
-      if (seenKeys.has(key)) {
+      if (seenKeys.has(event.dedupe_key)) {
         counters.events_deduped++;
         return;
       }
-      seenKeys.add(key);
-      buffer.push({ event, key });
+      seenKeys.add(event.dedupe_key);
+      buffer.push(event);
 
       if (buffer.length >= batchSize) {
         void flush();
@@ -244,21 +245,15 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   async function flush(): Promise<void> {
     if (buffer.length === 0) return;
     const batch = buffer.splice(0, buffer.length);
-    const body = {
-      schema_version: SCHEMA_VERSION,
-      product: config.product,
-      module: config.module,
-      batch_id: hash(batch.map((b) => b.key).join(',')),
-      ts: isoNow(),
-      // Each event carries its idempotency `id` so a retried batch can't double-count.
-      events: batch.map((b) => ({ ...b.event, id: b.key })),
-    };
     try {
-      await transport.send(ANALYTICS_PATH, body);
+      // The wire body is a bare array of events — matches the server's
+      // AnalyticsBatch schema exactly (no wrapping envelope).
+      await transport.send(ANALYTICS_PATH, batch);
       counters.events_sent += batch.length;
     } catch {
       // Requeue (keys stay in seenKeys, so no re-buffering) and count the drop.
-      // The stable ids mean the eventual successful send is idempotent downstream.
+      // Each event's own dedupe_key means the eventual successful send is
+      // idempotent downstream even after a retried batch.
       buffer.unshift(...batch);
       bumpDropped('event', batch.length);
     }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createTelemetry, type Transport } from '../src/index.js';
+import { createTelemetry, type Transport, type AnalyticsEvent } from '../src/index.js';
 
 interface Recorded {
   path: string;
@@ -14,6 +14,11 @@ function recordingTransport(): Transport & { calls: Recorded[] } {
       calls.push({ path, body: structuredClone(body) });
     },
   };
+}
+
+/** Analytics sends a bare array body (no envelope) — pull it out of the recorded calls. */
+function sentEvents(tx: { calls: Recorded[] }): AnalyticsEvent[] {
+  return tx.calls.filter((c) => c.path === '/ingest/analytics').flatMap((c) => c.body as AnalyticsEvent[]);
 }
 
 const baseConfig = {
@@ -116,7 +121,7 @@ describe('reportHealth', () => {
 });
 
 describe('track', () => {
-  it('auto-fills identity + ts, validates, and batches by size', async () => {
+  it('auto-fills identity + ts, validates, and batches by size — wire body is a bare array', async () => {
     const tx = recordingTransport();
     const t = createTelemetry({ ...baseConfig, transport: tx, batchSize: 2 });
     t.track({ event: 'invoice.created', props: { n: 1 } });
@@ -125,10 +130,15 @@ describe('track', () => {
     // size threshold reached -> flush scheduled
     await Promise.resolve();
     await t.flush();
-    const sent = tx.calls.flatMap((c) => c.body.events ?? []);
+
+    expect(tx.calls).toHaveLength(1);
+    expect(Array.isArray(tx.calls[0]!.body)).toBe(true); // no {events: [...]} envelope
+    const sent = sentEvents(tx);
     expect(sent.length).toBe(2);
-    expect(sent[0].product).toBe('billing');
-    expect(sent[0].schema_version).toBe(1);
+    expect(sent[0]!.product).toBe('billing');
+    expect(sent[0]!.schema_version).toBe(1);
+    expect(typeof sent[0]!.dedupe_key).toBe('string');
+    expect(sent[0]!.dedupe_key.length).toBeGreaterThan(0);
   });
 
   it('does not throw and bumps dropped when a batch flush fails', async () => {
@@ -158,19 +168,20 @@ describe('track', () => {
     t.track({ event: 'invoice.created', props: { n: 1 }, key: 'inv-1' });
     t.track({ event: 'invoice.created', props: { n: 1 }, key: 'inv-1' });
     await t.flush();
-    const sent = tx.calls.flatMap((c) => c.body.events ?? []);
+    const sent = sentEvents(tx);
     expect(sent.length).toBe(1);
+    expect(sent[0]!.dedupe_key).toBe('inv-1');
     expect(t.counters.events_deduped).toBe(1);
   });
 
-  it('survives a flaky transport: retry resends the same id, never duplicating', async () => {
+  it('survives a flaky transport: retry resends the same dedupe_key, never duplicating', async () => {
     let attempt = 0;
-    const sent: any[][] = [];
+    const sent: AnalyticsEvent[][] = [];
     const flaky: Transport = {
-      async send(_path, body: any) {
+      async send(_path, body) {
         attempt++;
         if (attempt === 1) throw new Error('transient');
-        sent.push(body.events);
+        sent.push(body as AnalyticsEvent[]);
       },
     };
     const t = createTelemetry({ ...baseConfig, transport: flaky });
@@ -179,7 +190,7 @@ describe('track', () => {
     await t.flush(); // succeeds
     expect(sent).toHaveLength(1);
     expect(sent[0]).toHaveLength(1);
-    expect(sent[0]![0].id).toBe('inv-9');
+    expect(sent[0]![0]!.dedupe_key).toBe('inv-9');
     expect(t.counters.events_sent).toBe(1);
   });
 });

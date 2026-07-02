@@ -90,7 +90,8 @@ describe('no-PII property test', () => {
     }
     await t.flush();
 
-    const emitted = tx.calls.flatMap((b) => b.events ?? []);
+    // wire body is a bare array of events — no {events: [...]} envelope.
+    const emitted = tx.calls.flatMap((b) => b as any[]);
     // every emitted event is PII-free
     for (const ev of emitted) {
       expect(scanForPii(ev)).toEqual([]);

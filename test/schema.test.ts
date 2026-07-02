@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   HealthReportSchema,
   AnalyticsEventSchema,
+  AnalyticsBatchSchema,
   SCHEMA_VERSION,
 } from '../src/index.js';
 
@@ -29,6 +30,7 @@ const validEvent = {
   session_id: 'sess_1',
   props: { amount: 1200, currency: 'usd', test: true },
   ts: '2026-06-29T00:00:00.000Z',
+  dedupe_key: 'inv_1:created',
 };
 
 describe('SCHEMA_VERSION', () => {
@@ -82,6 +84,10 @@ describe('AnalyticsEventSchema', () => {
     expect(AnalyticsEventSchema.safeParse({ ...validEvent, event: 'invoicecreated' }).success).toBe(false);
   });
 
+  it('rejects an event name starting with a digit', () => {
+    expect(AnalyticsEventSchema.safeParse({ ...validEvent, event: '1invoice.created' }).success).toBe(false);
+  });
+
   it('rejects props that are not string/number/boolean', () => {
     const bad = { ...validEvent, props: { nested: { a: 1 } } };
     expect(AnalyticsEventSchema.safeParse(bad).success).toBe(false);
@@ -91,7 +97,30 @@ describe('AnalyticsEventSchema', () => {
     expect(AnalyticsEventSchema.safeParse({ ...validEvent, schema_version: 99 }).success).toBe(false);
   });
 
-  it('rejects an unknown extra key (strict)', () => {
+  it('requires dedupe_key', () => {
+    const { dedupe_key, ...missing } = validEvent;
+    expect(AnalyticsEventSchema.safeParse(missing).success).toBe(false);
+  });
+
+  it('rejects an unknown extra key (strict) — in particular, the old "id" field name', () => {
     expect(AnalyticsEventSchema.safeParse({ ...validEvent, surprise: 1 }).success).toBe(false);
+    expect(AnalyticsEventSchema.safeParse({ ...validEvent, id: 'x' }).success).toBe(false);
+  });
+});
+
+describe('AnalyticsBatchSchema', () => {
+  // The wire body for POST /ingest/analytics is a bare array — no wrapping
+  // envelope object (no {events: [...]}). This is the contract the server
+  // (health-monitor/rebuild) actually validates against.
+  it('accepts a non-empty array of valid events', () => {
+    expect(AnalyticsBatchSchema.safeParse([validEvent]).success).toBe(true);
+  });
+
+  it('rejects an empty array', () => {
+    expect(AnalyticsBatchSchema.safeParse([]).success).toBe(false);
+  });
+
+  it('rejects a wrapped envelope object instead of a bare array', () => {
+    expect(AnalyticsBatchSchema.safeParse({ events: [validEvent] }).success).toBe(false);
   });
 });

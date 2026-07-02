@@ -8,11 +8,13 @@ export {
   HealthCheckSchema,
   HealthReportSchema,
   AnalyticsEventSchema,
+  AnalyticsBatchSchema,
   type HealthStatus,
   type CheckStatus,
   type HealthCheck,
   type HealthReport,
   type AnalyticsEvent,
+  type AnalyticsBatch,
   type PropValue,
 } from './schema.js';
 
