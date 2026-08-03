@@ -174,6 +174,58 @@ describe('track', () => {
     expect(t.counters.events_deduped).toBe(1);
   });
 
+  it('never grows the buffer past maxBufferedEvents while the sink is down — oldest dropped, newest kept', async () => {
+    let down = true;
+    const delivered: AnalyticsEvent[][] = [];
+    const tx: Transport = {
+      async send(_path, body) {
+        if (down) throw new Error('sink down');
+        delivered.push(body as AnalyticsEvent[]);
+      },
+    };
+    // batchSize high enough that nothing auto-flushes; cap at 50.
+    const t = createTelemetry({ ...baseConfig, transport: tx, batchSize: 10_000, maxBufferedEvents: 50 });
+    for (let i = 0; i < 60; i++) {
+      t.track({ event: 'cap.test', props: { i }, key: `cap-${i}` });
+    }
+    await t.flush(); // fails -> requeues, still capped
+    down = false;
+    await t.flush();
+
+    expect(delivered).toHaveLength(1);
+    const batch = delivered[0]!;
+    expect(batch).toHaveLength(50);
+    // Oldest 10 were dropped at the cap; newest survive in order.
+    expect(batch[0]!.dedupe_key).toBe('cap-10');
+    expect(batch[49]!.dedupe_key).toBe('cap-59');
+    // The 10 overflow drops are counted as real drops.
+    expect(t.counters.events_dropped).toBeGreaterThanOrEqual(10);
+  });
+
+  it('stays capped across repeated failed flushes with continued tracking', async () => {
+    let down = true;
+    const delivered: AnalyticsEvent[][] = [];
+    const tx: Transport = {
+      async send(_path, body) {
+        if (down) throw new Error('sink down');
+        delivered.push(body as AnalyticsEvent[]);
+      },
+    };
+    const t = createTelemetry({ ...baseConfig, transport: tx, batchSize: 10_000, maxBufferedEvents: 50 });
+    for (let i = 0; i < 40; i++) t.track({ event: 'cap.test', props: { i }, key: `a-${i}` });
+    await t.flush(); // fails -> 40 requeued
+    for (let i = 0; i < 20; i++) t.track({ event: 'cap.test', props: { i }, key: `b-${i}` });
+    await t.flush(); // fails -> 60 would requeue; cap trims to 50
+    down = false;
+    await t.flush();
+
+    const batch = delivered[0]!;
+    expect(batch).toHaveLength(50);
+    // The 10 oldest (a-0..a-9) fell off; the newest 20 all survive.
+    expect(batch[0]!.dedupe_key).toBe('a-10');
+    expect(batch[49]!.dedupe_key).toBe('b-19');
+  });
+
   it('survives a flaky transport: retry resends the same dedupe_key, never duplicating', async () => {
     let attempt = 0;
     const sent: AnalyticsEvent[][] = [];
