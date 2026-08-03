@@ -16,6 +16,7 @@ export function createTelemetry(config) {
     const heartbeatMs = config.heartbeatMs ?? 60_000;
     const batchSize = config.batchSize ?? 20;
     const batchIntervalMs = config.batchIntervalMs ?? 5_000;
+    const maxBufferedEvents = config.maxBufferedEvents ?? 1_000;
     const ttlSeconds = config.ttlSeconds ?? Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
     const autoStart = config.autoStart ?? true;
     const counters = {
@@ -136,6 +137,7 @@ export function createTelemetry(config) {
             }
             seenKeys.add(event.dedupe_key);
             buffer.push(event);
+            trimBufferToCap();
             if (buffer.length >= batchSize) {
                 void flush();
             }
@@ -160,7 +162,18 @@ export function createTelemetry(config) {
             // idempotent downstream even after a retried batch.
             buffer.unshift(...batch);
             bumpDropped('event', batch.length);
+            trimBufferToCap();
         }
+    }
+    /** Bounded-memory guarantee: the oldest buffered events fall off past the cap.
+     *  Their keys stay in seenKeys (same rule as requeue), so a re-track of an
+     *  identical event dedupes rather than resurrecting a dropped one. */
+    function trimBufferToCap() {
+        if (buffer.length <= maxBufferedEvents)
+            return;
+        const excess = buffer.length - maxBufferedEvents;
+        buffer.splice(0, excess);
+        bumpDropped('event', excess);
     }
     function start() {
         if (heartbeatMs > 0 && !heartbeatTimer) {

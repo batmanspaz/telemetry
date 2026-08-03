@@ -19,6 +19,10 @@ export interface TelemetryConfig {
     batchSize?: number;
     /** Flush the batch at least this often in ms (default 5000). 0 disables. */
     batchIntervalMs?: number;
+    /** Hard ceiling on buffered analytics events (default 1000). When the sink is
+     *  down and requeues accumulate past this, the OLDEST events are dropped (and
+     *  counted in events_dropped) so memory stays bounded. */
+    maxBufferedEvents?: number;
     /** Injectable clock (ms) for deterministic tests. */
     now?: () => number;
     /** Start the heartbeat + batch timers automatically (default true). */

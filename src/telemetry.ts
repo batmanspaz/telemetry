@@ -34,6 +34,10 @@ export interface TelemetryConfig {
   batchSize?: number;
   /** Flush the batch at least this often in ms (default 5000). 0 disables. */
   batchIntervalMs?: number;
+  /** Hard ceiling on buffered analytics events (default 1000). When the sink is
+   *  down and requeues accumulate past this, the OLDEST events are dropped (and
+   *  counted in events_dropped) so memory stays bounded. */
+  maxBufferedEvents?: number;
   /** Injectable clock (ms) for deterministic tests. */
   now?: () => number;
   /** Start the heartbeat + batch timers automatically (default true). */
@@ -102,6 +106,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   const heartbeatMs = config.heartbeatMs ?? 60_000;
   const batchSize = config.batchSize ?? 20;
   const batchIntervalMs = config.batchIntervalMs ?? 5_000;
+  const maxBufferedEvents = config.maxBufferedEvents ?? 1_000;
   const ttlSeconds = config.ttlSeconds ?? Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
   const autoStart = config.autoStart ?? true;
 
@@ -233,6 +238,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       }
       seenKeys.add(event.dedupe_key);
       buffer.push(event);
+      trimBufferToCap();
 
       if (buffer.length >= batchSize) {
         void flush();
@@ -256,7 +262,18 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       // idempotent downstream even after a retried batch.
       buffer.unshift(...batch);
       bumpDropped('event', batch.length);
+      trimBufferToCap();
     }
+  }
+
+  /** Bounded-memory guarantee: the oldest buffered events fall off past the cap.
+   *  Their keys stay in seenKeys (same rule as requeue), so a re-track of an
+   *  identical event dedupes rather than resurrecting a dropped one. */
+  function trimBufferToCap(): void {
+    if (buffer.length <= maxBufferedEvents) return;
+    const excess = buffer.length - maxBufferedEvents;
+    buffer.splice(0, excess);
+    bumpDropped('event', excess);
   }
 
   function start(): void {
