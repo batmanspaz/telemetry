@@ -26,10 +26,27 @@ export interface TelemetryConfig {
   instance?: string;
   /** Where emissions go. Defaults to noopTransport (a safe mock). */
   transport?: Transport;
-  /** Heartbeat interval in ms (default 60000). 0 disables the heartbeat. */
+  /** Heartbeat interval in ms (default 60000). 0 disables the heartbeat.
+   *  NOTE: this relies on a persistent setInterval and does NOT fire in
+   *  request/response serverless functions (the process suspends once the
+   *  response is sent, before the interval can tick). See `forceResendMs`
+   *  for the mechanism that also works there. */
   heartbeatMs?: number;
   /** Default ttl_seconds stamped on health reports that don't set their own. */
   ttlSeconds?: number;
+  /** Force a resend at least this often even without a status change,
+   *  checked inline against `now()` on every `reportHealth()` call — no
+   *  timer involved, so it works within a single request's lifecycle on
+   *  serverless/edge platforms where `heartbeatMs`'s setInterval cannot run.
+   *  Without this, a traffic-driven caller whose status never changes would
+   *  send exactly once (at cold start) and then go stale forever, even under
+   *  continuous real traffic, because "no status change" is architecturally
+   *  indistinguishable from "no traffic" once the interval can't fire.
+   *  Defaults to half of the effective `ttlSeconds`, so two reportHealth()
+   *  calls anywhere inside a ttl window are enough to stay fresh regardless
+   *  of platform. Set 0 to disable and rely purely on change-detection (only
+   *  safe on a persistent process where the heartbeat interval actually runs). */
+  forceResendMs?: number;
   /** Flush a batch once this many events are buffered (default 20). */
   batchSize?: number;
   /** Flush the batch at least this often in ms (default 5000). 0 disables. */
@@ -108,6 +125,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   const batchIntervalMs = config.batchIntervalMs ?? 5_000;
   const maxBufferedEvents = config.maxBufferedEvents ?? 1_000;
   const ttlSeconds = config.ttlSeconds ?? Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
+  const forceResendMs = config.forceResendMs ?? Math.floor((ttlSeconds * 1000) / 2);
   const autoStart = config.autoStart ?? true;
 
   const counters: Counters = {
@@ -122,6 +140,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
 
   let lastInput: HealthInput | null = null;
   let lastSentStatus: HealthStatus | null = null;
+  let lastSentAtMs: number | null = null;
 
   // Buffer holds fully-validated AnalyticsEvent objects (each already carries its
   // own dedupe_key) — the wire body is this array, verbatim, with no envelope.
@@ -178,6 +197,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       await transport.send(HEALTH_PATH, report);
       counters.health_sent++;
       lastSentStatus = report.status;
+      lastSentAtMs = now();
     } catch {
       bumpDropped('health');
     }
@@ -189,8 +209,15 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       const report = buildHealth(input);
       if (!report) return;
       // Emit immediately on a status change (debounced vs the last sent status).
-      // The heartbeat handles steady-state re-reporting.
-      if (lastSentStatus !== report.status) {
+      // Also force a resend once forceResendMs has elapsed since the last send,
+      // even with no status change — checked inline against now() here, not a
+      // timer, so this branch is what actually keeps a traffic-driven caller
+      // fresh on serverless (the setInterval heartbeat below is a bonus for
+      // persistent processes, not the correctness guarantee).
+      const statusChanged = lastSentStatus !== report.status;
+      const elapsedSinceSend = lastSentAtMs === null ? Infinity : now() - lastSentAtMs;
+      const forceDue = forceResendMs > 0 && elapsedSinceSend >= forceResendMs;
+      if (statusChanged || forceDue) {
         await sendHealth(report);
       }
     } catch {

@@ -58,6 +58,53 @@ describe('reportHealth', () => {
     expect(tx.calls[1]!.body.status).toBe('degraded');
   });
 
+  it('force-resends once forceResendMs elapses even with no status change, driven purely by explicit reportHealth() calls — no timer', async () => {
+    const tx = recordingTransport();
+    let clock = 1_700_000_000_000;
+    const t = createTelemetry({
+      ...baseConfig,
+      transport: tx,
+      now: () => clock,
+      forceResendMs: 5_000,
+    });
+
+    await t.reportHealth({ status: 'ok' }); // 1: first send
+    clock += 2_000;
+    await t.reportHealth({ status: 'ok' }); // same status, only 2s elapsed -> no send
+    clock += 4_000; // 6s elapsed since last send, past forceResendMs
+    await t.reportHealth({ status: 'ok' }); // 2: forced resend
+
+    expect(tx.calls).toHaveLength(2);
+    expect(tx.calls[0]!.body.status).toBe('ok');
+    expect(tx.calls[1]!.body.status).toBe('ok');
+  });
+
+  it('defaults forceResendMs to half the effective ttlSeconds, so a traffic-driven caller can never silently exceed its own ttl', async () => {
+    const tx = recordingTransport();
+    let clock = 1_700_000_000_000;
+    const t = createTelemetry({ ...baseConfig, transport: tx, now: () => clock, ttlSeconds: 100 });
+
+    await t.reportHealth({ status: 'ok' }); // 1
+    clock += 49_000; // under half of ttlSeconds (50s) -> no send
+    await t.reportHealth({ status: 'ok' });
+    clock += 2_000; // 51s elapsed -> past the default forceResendMs
+    await t.reportHealth({ status: 'ok' }); // 2: forced resend
+
+    expect(tx.calls).toHaveLength(2);
+  });
+
+  it('forceResendMs: 0 disables forced resend, restoring pure change-only behavior', async () => {
+    const tx = recordingTransport();
+    let clock = 1_700_000_000_000;
+    const t = createTelemetry({ ...baseConfig, transport: tx, now: () => clock, forceResendMs: 0 });
+
+    await t.reportHealth({ status: 'ok' });
+    clock += 10_000_000; // far past any reasonable ttl
+    await t.reportHealth({ status: 'ok' });
+
+    expect(tx.calls).toHaveLength(1);
+  });
+
   it('sends on the heartbeat interval as well as on change', async () => {
     vi.useFakeTimers();
     try {

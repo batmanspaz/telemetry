@@ -61,11 +61,12 @@ const telemetry = createTelemetry({
 Default transport is `noopTransport` (a safe mock) — omit `transport` for local dev
 and unit tests.
 
-### Health — heartbeat + on-change
+### Health — heartbeat + on-change + force-resend
 
 ```ts
 // Call whenever the module computes its health. Sends immediately on a status
-// change; the heartbeat re-reports steady state on its interval.
+// change; also force-resends once forceResendMs has elapsed since the last
+// send, even with no status change (default: half of ttlSeconds).
 await telemetry.reportHealth({
   status: 'ok',                       // 'ok' | 'degraded' | 'down' | 'stale'
   score: 98,                          // optional 0-100 rollup
@@ -76,6 +77,20 @@ await telemetry.reportHealth({
   // ttl_seconds defaults from config; product/module/version/ts auto-filled.
 });
 ```
+
+**Serverless / edge functions (Vercel, Workers, Lambda, etc.):** call
+`reportHealth()` on every request (or every N requests). `heartbeatMs`'s
+`setInterval` cannot fire once the process suspends after the response is
+sent — there is no persistent event loop to run it — so on these platforms
+the *only* thing keeping a module fresh between status changes is the inline
+`forceResendMs` check inside `reportHealth()` itself. This is on by default
+(`forceResendMs` defaults to half of the effective `ttlSeconds`), so as long
+as `reportHealth()` is actually invoked somewhere in your request path at
+least that often, you don't need to do anything extra. If your traffic is too
+sparse to guarantee that cadence, either lower `ttlSeconds` expectations
+accordingly or add your own scheduled trigger (cron) that calls
+`reportHealth()` directly — `heartbeatMs`'s timer is not a substitute on
+these platforms, only `forceResendMs` is.
 
 `reportHealth` auto-fills `schema_version`, `ts`, `product`, `module`, `version`, and
 appends a `telemetry.dropped` check so drops are always visible.

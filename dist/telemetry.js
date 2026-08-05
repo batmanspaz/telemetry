@@ -18,6 +18,7 @@ export function createTelemetry(config) {
     const batchIntervalMs = config.batchIntervalMs ?? 5_000;
     const maxBufferedEvents = config.maxBufferedEvents ?? 1_000;
     const ttlSeconds = config.ttlSeconds ?? Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
+    const forceResendMs = config.forceResendMs ?? Math.floor((ttlSeconds * 1000) / 2);
     const autoStart = config.autoStart ?? true;
     const counters = {
         health_sent: 0,
@@ -30,6 +31,7 @@ export function createTelemetry(config) {
     };
     let lastInput = null;
     let lastSentStatus = null;
+    let lastSentAtMs = null;
     // Buffer holds fully-validated AnalyticsEvent objects (each already carries its
     // own dedupe_key) — the wire body is this array, verbatim, with no envelope.
     const buffer = [];
@@ -80,6 +82,7 @@ export function createTelemetry(config) {
             await transport.send(HEALTH_PATH, report);
             counters.health_sent++;
             lastSentStatus = report.status;
+            lastSentAtMs = now();
         }
         catch {
             bumpDropped('health');
@@ -92,8 +95,15 @@ export function createTelemetry(config) {
             if (!report)
                 return;
             // Emit immediately on a status change (debounced vs the last sent status).
-            // The heartbeat handles steady-state re-reporting.
-            if (lastSentStatus !== report.status) {
+            // Also force a resend once forceResendMs has elapsed since the last send,
+            // even with no status change — checked inline against now() here, not a
+            // timer, so this branch is what actually keeps a traffic-driven caller
+            // fresh on serverless (the setInterval heartbeat below is a bonus for
+            // persistent processes, not the correctness guarantee).
+            const statusChanged = lastSentStatus !== report.status;
+            const elapsedSinceSend = lastSentAtMs === null ? Infinity : now() - lastSentAtMs;
+            const forceDue = forceResendMs > 0 && elapsedSinceSend >= forceResendMs;
+            if (statusChanged || forceDue) {
                 await sendHealth(report);
             }
         }
