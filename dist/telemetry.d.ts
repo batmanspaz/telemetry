@@ -11,10 +11,27 @@ export interface TelemetryConfig {
     instance?: string;
     /** Where emissions go. Defaults to noopTransport (a safe mock). */
     transport?: Transport;
-    /** Heartbeat interval in ms (default 60000). 0 disables the heartbeat. */
+    /** Heartbeat interval in ms (default 60000). 0 disables the heartbeat.
+     *  NOTE: this relies on a persistent setInterval and does NOT fire in
+     *  request/response serverless functions (the process suspends once the
+     *  response is sent, before the interval can tick). See `forceResendMs`
+     *  for the mechanism that also works there. */
     heartbeatMs?: number;
     /** Default ttl_seconds stamped on health reports that don't set their own. */
     ttlSeconds?: number;
+    /** Force a resend at least this often even without a status change,
+     *  checked inline against `now()` on every `reportHealth()` call — no
+     *  timer involved, so it works within a single request's lifecycle on
+     *  serverless/edge platforms where `heartbeatMs`'s setInterval cannot run.
+     *  Without this, a traffic-driven caller whose status never changes would
+     *  send exactly once (at cold start) and then go stale forever, even under
+     *  continuous real traffic, because "no status change" is architecturally
+     *  indistinguishable from "no traffic" once the interval can't fire.
+     *  Defaults to half of the effective `ttlSeconds`, so two reportHealth()
+     *  calls anywhere inside a ttl window are enough to stay fresh regardless
+     *  of platform. Set 0 to disable and rely purely on change-detection (only
+     *  safe on a persistent process where the heartbeat interval actually runs). */
+    forceResendMs?: number;
     /** Flush a batch once this many events are buffered (default 20). */
     batchSize?: number;
     /** Flush the batch at least this often in ms (default 5000). 0 disables. */
