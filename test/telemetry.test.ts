@@ -293,3 +293,99 @@ describe('track', () => {
     expect(t.counters.events_sent).toBe(1);
   });
 });
+
+// 2026-08-06 — a fire-and-forget `void telemetry.reportHealth(...)` call site has no completion
+// guarantee once a serverless response flushes (Vercel Fluid Compute ships `waitUntil`/`after`
+// specifically because unawaited work is NOT otherwise kept alive). Live-repro'd on pagewright's
+// collect:staging: 4 of 5 sequential real requests silently failed to send a health report — no
+// ingest row, no health_dropped bump, i.e. execution was cut off before sendHealth's try/catch
+// even ran. `keepAlive` lets a product hand the library's in-flight promise to the platform's own
+// keep-alive primitive, closing the gap for every call site (including the library's own internal
+// fire-and-forget spots) without requiring any product to change how it calls reportHealth/flush.
+describe('keepAlive', () => {
+  it('hands reportHealth a promise to keepAlive synchronously, so a void-called send still completes once the platform awaits it', async () => {
+    const tx = recordingTransport();
+    const registered: Promise<unknown>[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: tx, keepAlive: (p) => registered.push(p) });
+
+    void t.reportHealth({ status: 'ok' }); // mimics a product call site that discards the promise
+
+    expect(registered).toHaveLength(1); // registered synchronously, before the void-call returns
+    await registered[0]; // simulates the platform's waitUntil actually awaiting it — must not throw
+    expect(tx.calls).toHaveLength(1); // the send genuinely completed
+    expect(tx.calls[0]!.body.status).toBe('ok');
+  });
+
+  it('omitting keepAlive preserves exact prior behavior (no-op default, no throw on a void-called send)', async () => {
+    const tx = recordingTransport();
+    const t = createTelemetry({ ...baseConfig, transport: tx });
+
+    expect(() => void t.reportHealth({ status: 'ok' })).not.toThrow();
+    await t.reportHealth({ status: 'degraded' }); // awaited call still works normally
+    expect(tx.calls.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('hands flush() a promise to keepAlive too', async () => {
+    const tx = recordingTransport();
+    const registered: Promise<unknown>[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: tx, keepAlive: (p) => registered.push(p) });
+
+    t.track({ event: 'invoice.created', props: { n: 1 } });
+    void t.flush();
+
+    expect(registered).toHaveLength(1);
+    await registered[0];
+    expect(sentEvents(tx)).toHaveLength(1);
+  });
+
+  it('registers the heartbeat-interval-triggered resend with keepAlive too (the library\'s own internal fire-and-forget)', async () => {
+    vi.useFakeTimers();
+    try {
+      const tx = recordingTransport();
+      const registered: Promise<unknown>[] = [];
+      const t = createTelemetry({
+        ...baseConfig,
+        autoStart: true,
+        heartbeatMs: 1000,
+        transport: tx,
+        keepAlive: (p) => registered.push(p),
+      });
+      await t.reportHealth({ status: 'ok' }); // immediate send (1 registration)
+      await vi.advanceTimersByTimeAsync(1500); // one heartbeat tick
+      t.stop();
+
+      // one registration for the initial reportHealth() + at least one for the heartbeat tick
+      expect(registered.length).toBeGreaterThanOrEqual(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('registers the batch-size-triggered and batch-interval-triggered flush with keepAlive too', async () => {
+    vi.useFakeTimers();
+    try {
+      const tx = recordingTransport();
+      const registered: Promise<unknown>[] = [];
+      const t = createTelemetry({
+        ...baseConfig,
+        autoStart: true,
+        batchSize: 2,
+        batchIntervalMs: 1000,
+        transport: tx,
+        keepAlive: (p) => registered.push(p),
+      });
+
+      t.track({ event: 'test.a', props: {} });
+      t.track({ event: 'test.b', props: {} }); // hits batchSize -> internal void flush()
+      expect(registered.length).toBeGreaterThanOrEqual(1);
+
+      const afterBatchSize = registered.length;
+      t.track({ event: 'test.c', props: {} });
+      await vi.advanceTimersByTimeAsync(1500); // batch interval tick -> internal void flush()
+      t.stop();
+      expect(registered.length).toBeGreaterThan(afterBatchSize);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

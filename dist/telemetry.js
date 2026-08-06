@@ -20,6 +20,7 @@ export function createTelemetry(config) {
     const ttlSeconds = config.ttlSeconds ?? Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
     const forceResendMs = config.forceResendMs ?? Math.floor((ttlSeconds * 1000) / 2);
     const autoStart = config.autoStart ?? true;
+    const keepAlive = config.keepAlive ?? (() => { });
     const counters = {
         health_sent: 0,
         health_dropped: 0,
@@ -88,7 +89,7 @@ export function createTelemetry(config) {
             bumpDropped('health');
         }
     }
-    async function reportHealth(input) {
+    async function doReportHealth(input) {
         try {
             lastInput = input;
             const report = buildHealth(input);
@@ -110,6 +111,14 @@ export function createTelemetry(config) {
         catch {
             bumpDropped('health');
         }
+    }
+    // Registers every send with `keepAlive` synchronously, before returning the promise, so a
+    // caller's `void telemetry.reportHealth(...)` — the common product call-site pattern — still
+    // gets kept alive by the platform when configured. No call site needs to change.
+    function reportHealth(input) {
+        const p = doReportHealth(input);
+        keepAlive(p);
+        return p;
     }
     function track(input) {
         try {
@@ -156,7 +165,7 @@ export function createTelemetry(config) {
             bumpDropped('event');
         }
     }
-    async function flush() {
+    async function doFlush() {
         if (buffer.length === 0)
             return;
         const batch = buffer.splice(0, buffer.length);
@@ -175,6 +184,12 @@ export function createTelemetry(config) {
             trimBufferToCap();
         }
     }
+    // Same keepAlive registration as reportHealth() above, for the same reason.
+    function flush() {
+        const p = doFlush();
+        keepAlive(p);
+        return p;
+    }
     /** Bounded-memory guarantee: the oldest buffered events fall off past the cap.
      *  Their keys stay in seenKeys (same rule as requeue), so a re-track of an
      *  identical event dedupes rather than resurrecting a dropped one. */
@@ -192,7 +207,7 @@ export function createTelemetry(config) {
                     return;
                 const report = buildHealth(lastInput);
                 if (report)
-                    void sendHealth(report);
+                    keepAlive(sendHealth(report));
             }, heartbeatMs);
             heartbeatTimer.unref?.();
         }

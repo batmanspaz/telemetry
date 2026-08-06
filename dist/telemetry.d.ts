@@ -44,6 +44,19 @@ export interface TelemetryConfig {
     now?: () => number;
     /** Start the heartbeat + batch timers automatically (default true). */
     autoStart?: boolean;
+    /** Hand the platform's own keep-alive primitive (Vercel's `waitUntil` from
+     *  `@vercel/functions`, Cloudflare Workers' `ctx.waitUntil`, etc.) every
+     *  in-flight send this client fires. Without this, an unawaited call —
+     *  `void telemetry.reportHealth(...)`, the common product call-site pattern —
+     *  has no completion guarantee once a serverless response flushes (confirmed
+     *  live 2026-08-06: pagewright's collect:staging silently dropped 4 of 5
+     *  sequential real health reports this way, with no ingest row and no
+     *  health_dropped bump — execution was cut off before sendHealth's own
+     *  try/catch ran). Registered synchronously on every reportHealth()/flush()
+     *  call (and the library's own internal heartbeat/batch fire-and-forget
+     *  sends), so no product call site needs to change. Defaults to a no-op —
+     *  omitting this preserves exactly today's behavior. */
+    keepAlive?: (p: Promise<unknown>) => void;
 }
 export interface Counters {
     health_sent: number;

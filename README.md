@@ -92,6 +92,31 @@ accordingly or add your own scheduled trigger (cron) that calls
 `reportHealth()` directly — `heartbeatMs`'s timer is not a substitute on
 these platforms, only `forceResendMs` is.
 
+**`forceResendMs` still needs its own request to be delivered.** Product call
+sites almost always call `reportHealth()`/`flush()` fire-and-forget —
+`void telemetry.reportHealth(...)` — so the response can return without
+waiting on the network round-trip. On Vercel Fluid Compute (and similar
+platforms) an unawaited call has **no completion guarantee** once the
+response flushes; live-confirmed 2026-08-06, a fast-returning handler with
+little I/O ahead of the telemetry call silently dropped 4 of 5 sequential
+sends (no ingest row, no `health_dropped` bump — execution was cut off
+before `sendHealth`'s own try/catch ran). Pass `keepAlive` to close this:
+
+```ts
+import { waitUntil } from '@vercel/functions'; // or ctx.waitUntil on CF Workers
+
+const telemetry = createPagewrightTelemetry({
+  module: 'collect',
+  keepAlive: waitUntil, // registers every in-flight send with the platform
+  // ...
+});
+```
+
+`keepAlive(promise)` is called synchronously on every `reportHealth()` and
+`flush()` call (and the library's own internal heartbeat/batch
+fire-and-forget sends) — **no product call site needs to change.** Omit it
+and behavior is exactly as before (a safe no-op default).
+
 `reportHealth` auto-fills `schema_version`, `ts`, `product`, `module`, `version`, and
 appends a `telemetry.dropped` check so drops are always visible.
 
@@ -157,10 +182,11 @@ Ship `noopTransport` (default mock) and `httpTransport` (HMAC-SHA256 signed, inj
 
 `stale after TTL` · `status-change emits immediately` · `off-schema rejected` ·
 `emission failure non-blocking AND bumps telemetry.dropped` · `batched + idempotent
-(retry → no dup)` · `no-PII property test over a generated event corpus`.
+(retry → no dup)` · `no-PII property test over a generated event corpus` ·
+`keepAlive registered synchronously on reportHealth/flush + internal heartbeat/batch sends`.
 
 ```bash
-pnpm test   # 40 tests green
+pnpm test   # 55 tests green
 ```
 
 No secrets in code — the HMAC key is sourced from config/env at runtime.
