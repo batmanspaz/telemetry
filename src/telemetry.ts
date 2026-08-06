@@ -59,6 +59,19 @@ export interface TelemetryConfig {
   now?: () => number;
   /** Start the heartbeat + batch timers automatically (default true). */
   autoStart?: boolean;
+  /** Hand the platform's own keep-alive primitive (Vercel's `waitUntil` from
+   *  `@vercel/functions`, Cloudflare Workers' `ctx.waitUntil`, etc.) every
+   *  in-flight send this client fires. Without this, an unawaited call —
+   *  `void telemetry.reportHealth(...)`, the common product call-site pattern —
+   *  has no completion guarantee once a serverless response flushes (confirmed
+   *  live 2026-08-06: pagewright's collect:staging silently dropped 4 of 5
+   *  sequential real health reports this way, with no ingest row and no
+   *  health_dropped bump — execution was cut off before sendHealth's own
+   *  try/catch ran). Registered synchronously on every reportHealth()/flush()
+   *  call (and the library's own internal heartbeat/batch fire-and-forget
+   *  sends), so no product call site needs to change. Defaults to a no-op —
+   *  omitting this preserves exactly today's behavior. */
+  keepAlive?: (p: Promise<unknown>) => void;
 }
 
 export interface Counters {
@@ -127,6 +140,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   const ttlSeconds = config.ttlSeconds ?? Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
   const forceResendMs = config.forceResendMs ?? Math.floor((ttlSeconds * 1000) / 2);
   const autoStart = config.autoStart ?? true;
+  const keepAlive = config.keepAlive ?? (() => {});
 
   const counters: Counters = {
     health_sent: 0,
@@ -203,7 +217,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     }
   }
 
-  async function reportHealth(input: HealthInput): Promise<void> {
+  async function doReportHealth(input: HealthInput): Promise<void> {
     try {
       lastInput = input;
       const report = buildHealth(input);
@@ -223,6 +237,15 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     } catch {
       bumpDropped('health');
     }
+  }
+
+  // Registers every send with `keepAlive` synchronously, before returning the promise, so a
+  // caller's `void telemetry.reportHealth(...)` — the common product call-site pattern — still
+  // gets kept alive by the platform when configured. No call site needs to change.
+  function reportHealth(input: HealthInput): Promise<void> {
+    const p = doReportHealth(input);
+    keepAlive(p);
+    return p;
   }
 
   function track(input: TrackInput): void {
@@ -275,7 +298,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     }
   }
 
-  async function flush(): Promise<void> {
+  async function doFlush(): Promise<void> {
     if (buffer.length === 0) return;
     const batch = buffer.splice(0, buffer.length);
     try {
@@ -293,6 +316,13 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     }
   }
 
+  // Same keepAlive registration as reportHealth() above, for the same reason.
+  function flush(): Promise<void> {
+    const p = doFlush();
+    keepAlive(p);
+    return p;
+  }
+
   /** Bounded-memory guarantee: the oldest buffered events fall off past the cap.
    *  Their keys stay in seenKeys (same rule as requeue), so a re-track of an
    *  identical event dedupes rather than resurrecting a dropped one. */
@@ -308,7 +338,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       heartbeatTimer = setInterval(() => {
         if (!lastInput) return;
         const report = buildHealth(lastInput);
-        if (report) void sendHealth(report);
+        if (report) keepAlive(sendHealth(report));
       }, heartbeatMs);
       heartbeatTimer.unref?.();
     }
