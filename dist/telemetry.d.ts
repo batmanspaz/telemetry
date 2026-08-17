@@ -40,6 +40,9 @@ export interface TelemetryConfig {
      *  down and requeues accumulate past this, the OLDEST events are dropped (and
      *  counted in events_dropped) so memory stays bounded. */
     maxBufferedEvents?: number;
+    /** Called when the client does something a caller would want to know about but cannot detect —
+     *  today, collapsing two reports whose `checks` DIFFER. Optional; the client never requires it. */
+    onWarn?: (message: string) => void;
     /** Injectable clock (ms) for deterministic tests. */
     now?: () => number;
     /** Start the heartbeat + batch timers automatically (default true). */
@@ -65,6 +68,12 @@ export interface Counters {
     events_sent: number;
     events_dropped: number;
     events_deduped: number;
+    /** Health reports the same-status debounce declined to send. DELIBERATELY NOT part of
+     *  `dropped`: folding it in would fix one lie by telling another, since every healthy service
+     *  debounces constantly and would then report drops forever. Kept separate so "we failed to
+     *  send" and "we chose not to send" stay distinguishable — the distinction InTake needed on
+     *  2026-08-17 and could not get. */
+    health_suppressed: number;
     /** telemetry.dropped rollup (health + events) surfaced as a health check. */
     dropped: number;
 }

@@ -389,3 +389,85 @@ describe('keepAlive', () => {
     }
   });
 });
+
+// 2026-08-17 — from the InTake session's harness handoff.
+//
+// InTake shipped a bug to this: two health reports from the same process, same product/module,
+// ~4s apart, both status ok, with DIFFERENT checks arrays. The second never arrived — absent from
+// the append-only health_events table, so never transmitted, not merely superseded. It was the
+// same-status debounce below, working as designed.
+//
+// The design is right; the SILENCE is the bug. The caller got no error, no return value, and
+// `telemetry.dropped` stayed 0 throughout — so by the platform's own metric nothing was dropped.
+// A counter that reads as "emission failures" while excluding deliberate suppression is a counter
+// that lies at exactly the moment someone is trying to work out where their data went.
+describe('suppression is visible, not silent', () => {
+  it('counts a suppressed report in health_suppressed', async () => {
+    const tx = recordingTransport();
+    const t = createTelemetry({ ...baseConfig, transport: tx });
+    await t.reportHealth({ status: 'ok', checks: [{ id: 'a', status: 'pass' }] });
+    await t.reportHealth({ status: 'ok', checks: [{ id: 'a', status: 'pass' }] });
+    expect(tx.calls).toHaveLength(1);
+    expect(t.counters.health_suppressed).toBe(1);
+  });
+
+  it('does NOT count suppression as a drop — telemetry.dropped must keep meaning "we failed to send"', async () => {
+    // Folding suppression into `dropped` would fix the silence by making an honest counter
+    // dishonest in the other direction: every healthy service would report drops forever.
+    const tx = recordingTransport();
+    const t = createTelemetry({ ...baseConfig, transport: tx });
+    await t.reportHealth({ status: 'ok' });
+    await t.reportHealth({ status: 'ok' });
+    expect(t.counters.dropped).toBe(0);
+    expect(t.counters.health_dropped).toBe(0);
+  });
+
+  it('WARNS when the collapsed reports carry different checks — that is a caller mistake', async () => {
+    // Identical repeats are exactly what the debounce is for; suppressing them silently is
+    // correct. Differing checks mean the caller believes it is reporting something new and is
+    // not — cheap for the client to detect, and impossible for the caller to notice.
+    const warnings: string[] = [];
+    const tx = recordingTransport();
+    const t = createTelemetry({ ...baseConfig, transport: tx, onWarn: (m) => warnings.push(m) });
+    await t.reportHealth({ status: 'ok', checks: [{ id: 'a', status: 'pass' }] });
+    await t.reportHealth({ status: 'ok', checks: [{ id: 'b', status: 'pass' }] });
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toMatch(/suppress/i);
+    expect(warnings[0]).toMatch(/check/i);
+  });
+
+  it('does NOT warn when the checks are identical — the debounce doing its job is not news', async () => {
+    const warnings: string[] = [];
+    const tx = recordingTransport();
+    const t = createTelemetry({ ...baseConfig, transport: tx, onWarn: (m) => warnings.push(m) });
+    await t.reportHealth({ status: 'ok', checks: [{ id: 'a', status: 'pass' }] });
+    await t.reportHealth({ status: 'ok', checks: [{ id: 'a', status: 'pass' }] });
+    expect(warnings).toHaveLength(0);
+  });
+
+  it('detects a changed check STATUS, not just a changed id', async () => {
+    const warnings: string[] = [];
+    const tx = recordingTransport();
+    const t = createTelemetry({ ...baseConfig, transport: tx, onWarn: (m) => warnings.push(m) });
+    await t.reportHealth({ status: 'ok', checks: [{ id: 'a', status: 'pass' }] });
+    await t.reportHealth({ status: 'ok', checks: [{ id: 'a', status: 'warn' }] });
+    expect(warnings).toHaveLength(1);
+  });
+
+  it('no warning when the report is actually SENT — nothing was suppressed', async () => {
+    const warnings: string[] = [];
+    const tx = recordingTransport();
+    const t = createTelemetry({ ...baseConfig, transport: tx, onWarn: (m) => warnings.push(m) });
+    await t.reportHealth({ status: 'ok', checks: [{ id: 'a', status: 'pass' }] });
+    await t.reportHealth({ status: 'down', checks: [{ id: 'a', status: 'fail' }] });
+    expect(tx.calls).toHaveLength(2);
+    expect(warnings).toHaveLength(0);
+  });
+
+  it('omitting onWarn is safe — the client must never require a hook to function', async () => {
+    const tx = recordingTransport();
+    const t = createTelemetry({ ...baseConfig, transport: tx });
+    await t.reportHealth({ status: 'ok', checks: [{ id: 'a', status: 'pass' }] });
+    await expect(t.reportHealth({ status: 'ok', checks: [{ id: 'b', status: 'pass' }] })).resolves.toBeUndefined();
+  });
+});

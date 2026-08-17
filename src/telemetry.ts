@@ -55,6 +55,9 @@ export interface TelemetryConfig {
    *  down and requeues accumulate past this, the OLDEST events are dropped (and
    *  counted in events_dropped) so memory stays bounded. */
   maxBufferedEvents?: number;
+  /** Called when the client does something a caller would want to know about but cannot detect —
+   *  today, collapsing two reports whose `checks` DIFFER. Optional; the client never requires it. */
+  onWarn?: (message: string) => void;
   /** Injectable clock (ms) for deterministic tests. */
   now?: () => number;
   /** Start the heartbeat + batch timers automatically (default true). */
@@ -81,6 +84,12 @@ export interface Counters {
   events_sent: number;
   events_dropped: number;
   events_deduped: number;
+  /** Health reports the same-status debounce declined to send. DELIBERATELY NOT part of
+   *  `dropped`: folding it in would fix one lie by telling another, since every healthy service
+   *  debounces constantly and would then report drops forever. Kept separate so "we failed to
+   *  send" and "we chose not to send" stay distinguishable — the distinction InTake needed on
+   *  2026-08-17 and could not get. */
+  health_suppressed: number;
   /** telemetry.dropped rollup (health + events) surfaced as a health check. */
   dropped: number;
 }
@@ -149,12 +158,21 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     events_sent: 0,
     events_dropped: 0,
     events_deduped: 0,
+    health_suppressed: 0,
     dropped: 0,
   };
 
   let lastInput: HealthInput | null = null;
   let lastSentStatus: HealthStatus | null = null;
   let lastSentAtMs: number | null = null;
+  /** The checks actually transmitted last, so a suppressed report can be compared against what
+   *  the platform genuinely holds — not against the previous call, which may itself have been
+   *  suppressed. */
+  let lastSentChecksKey: string | null = null;
+
+  const onWarn = config.onWarn;
+  const checksKey = (checks?: HealthCheck[]): string =>
+    JSON.stringify((checks ?? []).map((c) => [c.id, c.status]).sort());
 
   // Buffer holds fully-validated AnalyticsEvent objects (each already carries its
   // own dedupe_key) — the wire body is this array, verbatim, with no envelope.
@@ -233,6 +251,25 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       const forceDue = forceResendMs > 0 && elapsedSinceSend >= forceResendMs;
       if (statusChanged || forceDue) {
         await sendHealth(report);
+        lastSentChecksKey = checksKey(input.checks);
+        return;
+      }
+
+      // Suppressed. Make it VISIBLE — this branch used to return in total silence, which is how
+      // InTake lost a report on 2026-08-17: no error, no return value, and `telemetry.dropped`
+      // still 0, so by the platform's own metric nothing had happened.
+      counters.health_suppressed += 1;
+      const key = checksKey(input.checks);
+      if (onWarn && lastSentChecksKey !== null && key !== lastSentChecksKey) {
+        // Identical repeats are exactly what the debounce is for and are not worth a word.
+        // DIFFERING checks mean the caller believes it is reporting something new and is not —
+        // cheap to detect here, impossible to notice from the call site.
+        onWarn(
+          `[telemetry] suppressed a health report whose checks DIFFER from the last one sent ` +
+            `(${config.product}/${config.module}, status unchanged: ${report.status}). The debounce ` +
+            `only re-sends on a status change or after forceResendMs, so this payload was never ` +
+            `transmitted. If these checks belong to a distinct concern, give them their own module.`,
+        );
       }
     } catch {
       bumpDropped('health');
