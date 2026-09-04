@@ -21,10 +21,18 @@ jobs:
       - name: Test
         run: pnpm test
       - name: Verify dist/ is committed and up to date
-        # dist/ is checked in (not gitignored) so tarball/git-URL installs — which
-        # don't run the `prepare` lifecycle script — always get built output.
-        # Fails loud if src/ changed without rebuilding dist/, instead of silently
-        # shipping stale output to every consumer.
+        # dist/ is checked in (not gitignored) so tarball/git-URL installs get
+        # built output without npm needing to build anything itself. The build
+        # script is deliberately named `compile`, not `build`: pacote's git
+        # fetcher (lib/git.js#prepareDir) treats a package.json `build` script
+        # key (also postinstall/preinstall/install/prepack/prepare) as a signal
+        # that a git dependency needs "preparation" and runs a forced
+        # `npm install --force --no-save ...` inside the cloned dir on every
+        # consumer install — even though dist/ is already current — which hits
+        # an intermittent npm Arborist crash (npm/cli#9787, #9911). Keep this
+        # script named something outside that trigger list.
+        # This step fails loud if src/ changed without rebuilding dist/,
+        # instead of silently shipping stale output to every consumer.
         run: |
-          pnpm run build
+          pnpm run compile
           git diff --exit-code -- dist/
