@@ -34,7 +34,7 @@ Workspace package (private). Depend on it by name:
 ```
 
 ```bash
-pnpm build      # tsc -> dist/
+pnpm compile    # tsc -> dist/
 pnpm test       # vitest run
 pnpm typecheck  # tsc --noEmit
 ```
