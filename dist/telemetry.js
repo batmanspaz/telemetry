@@ -44,6 +44,11 @@ export function createTelemetry(config) {
     // own dedupe_key) — the wire body is this array, verbatim, with no envelope.
     const buffer = [];
     const seenKeys = new Set();
+    // CS-0209: reference point for the inline batchIntervalMs force-flush check in
+    // track() below — starts at client construction (not null/never), so the interval
+    // countdown begins immediately rather than forcing a flush on the very first
+    // track() call (an elapsed-since-null "Infinity" would defeat batching entirely).
+    let lastFlushAtMs = now();
     let heartbeatTimer = null;
     let batchTimer = null;
     function bumpDropped(kind, n = 1) {
@@ -180,7 +185,15 @@ export function createTelemetry(config) {
             seenKeys.add(event.dedupe_key);
             buffer.push(event);
             trimBufferToCap();
-            if (buffer.length >= batchSize) {
+            // CS-0209: force a flush once batchIntervalMs has elapsed since the last flush
+            // attempt, even under batchSize — checked inline against now() here, not a
+            // timer, so this is what actually keeps a sub-batchSize caller's buffer from
+            // growing forever on serverless (the setInterval batchTimer below is a bonus
+            // for persistent processes, not the correctness guarantee — same relationship
+            // forceResendMs has to the heartbeat timer for health).
+            const elapsedSinceFlush = now() - lastFlushAtMs;
+            const intervalDue = batchIntervalMs > 0 && elapsedSinceFlush >= batchIntervalMs;
+            if (buffer.length >= batchSize || intervalDue) {
                 void flush();
             }
         }
@@ -191,6 +204,7 @@ export function createTelemetry(config) {
     async function doFlush() {
         if (buffer.length === 0)
             return;
+        lastFlushAtMs = now();
         const batch = buffer.splice(0, buffer.length);
         try {
             // The wire body is a bare array of events — matches the server's

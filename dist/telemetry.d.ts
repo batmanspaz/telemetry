@@ -34,7 +34,16 @@ export interface TelemetryConfig {
     forceResendMs?: number;
     /** Flush a batch once this many events are buffered (default 20). */
     batchSize?: number;
-    /** Flush the batch at least this often in ms (default 5000). 0 disables. */
+    /** Flush the batch at least this often in ms (default 5000). 0 disables.
+     *  NOTE (CS-0209, 2026-09-07): a `setInterval`-driven flush alone does NOT fire in
+     *  request/response serverless functions (the process suspends once the response is
+     *  sent, before the interval can tick) — the exact same gap `forceResendMs` closed
+     *  for health. `track()` also checks this inline against `now()` on every call and
+     *  force-flushes the buffer once this many ms have elapsed since the last flush, even
+     *  under `batchSize` — so a caller that tracks fewer than `batchSize` events per
+     *  invocation still flushes on a serverless platform where the timer never runs. Set
+     *  0 to disable and rely purely on `batchSize` (only safe on a persistent process
+     *  where the interval timer actually runs). */
     batchIntervalMs?: number;
     /** Hard ceiling on buffered analytics events (default 1000). When the sink is
      *  down and requeues accumulate past this, the OLDEST events are dropped (and

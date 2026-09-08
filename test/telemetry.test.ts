@@ -188,6 +188,59 @@ describe('track', () => {
     expect(sent[0]!.dedupe_key.length).toBeGreaterThan(0);
   });
 
+  // 2026-09-07 (CS-0209) — the analytics batch had the EXACT same architectural gap
+  // `forceResendMs` (above) was built to close on the health side: `batchIntervalMs`
+  // was documented as "flush the batch at least this often" but was implemented ONLY
+  // as a `setInterval`, which never ticks in a request/response serverless function
+  // (the process suspends once the response is sent, before the timer can fire) —
+  // found while investigating a DIFFERENT reported bug (CS-0208) and confirmed real.
+  // A caller that tracks fewer than `batchSize` events per invocation (the common
+  // case) would buffer forever and never flush on a platform like Vercel. Fixed the
+  // same way `forceResendMs` fixed it for health: an inline elapsed-time check on
+  // every `track()` call, not a timer.
+  it('force-flushes once batchIntervalMs elapses even under batchSize, driven purely by explicit track() calls — no timer', async () => {
+    const tx = recordingTransport();
+    let clock = 1_700_000_000_000;
+    const t = createTelemetry({
+      ...baseConfig,
+      transport: tx,
+      now: () => clock,
+      batchSize: 100, // never reached by size alone in this test
+      batchIntervalMs: 5_000,
+    });
+
+    t.track({ event: 'invoice.created', props: { n: 1 } }); // buffered, no flush yet
+    expect(tx.calls).toHaveLength(0);
+
+    clock += 6_000; // past batchIntervalMs since client creation, still under batchSize
+    t.track({ event: 'invoice.created', props: { n: 2 } }); // should force a flush now
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(tx.calls).toHaveLength(1);
+    const sent = sentEvents(tx);
+    expect(sent.length).toBe(2); // both buffered events flushed together
+  });
+
+  it('batchIntervalMs: 0 disables the time-based force-flush, restoring pure size-only behavior', async () => {
+    const tx = recordingTransport();
+    let clock = 1_700_000_000_000;
+    const t = createTelemetry({
+      ...baseConfig,
+      transport: tx,
+      now: () => clock,
+      batchSize: 100,
+      batchIntervalMs: 0,
+    });
+
+    t.track({ event: 'invoice.created', props: { n: 1 } });
+    clock += 10_000_000; // far past any reasonable interval
+    t.track({ event: 'invoice.created', props: { n: 2 } });
+    await Promise.resolve();
+
+    expect(tx.calls).toHaveLength(0); // still buffered — only size or an explicit flush() sends
+  });
+
   it('does not throw and bumps dropped when a batch flush fails', async () => {
     const failing: Transport = {
       async send() {

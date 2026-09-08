@@ -49,7 +49,16 @@ export interface TelemetryConfig {
   forceResendMs?: number;
   /** Flush a batch once this many events are buffered (default 20). */
   batchSize?: number;
-  /** Flush the batch at least this often in ms (default 5000). 0 disables. */
+  /** Flush the batch at least this often in ms (default 5000). 0 disables.
+   *  NOTE (CS-0209, 2026-09-07): a `setInterval`-driven flush alone does NOT fire in
+   *  request/response serverless functions (the process suspends once the response is
+   *  sent, before the interval can tick) — the exact same gap `forceResendMs` closed
+   *  for health. `track()` also checks this inline against `now()` on every call and
+   *  force-flushes the buffer once this many ms have elapsed since the last flush, even
+   *  under `batchSize` — so a caller that tracks fewer than `batchSize` events per
+   *  invocation still flushes on a serverless platform where the timer never runs. Set
+   *  0 to disable and rely purely on `batchSize` (only safe on a persistent process
+   *  where the interval timer actually runs). */
   batchIntervalMs?: number;
   /** Hard ceiling on buffered analytics events (default 1000). When the sink is
    *  down and requeues accumulate past this, the OLDEST events are dropped (and
@@ -178,6 +187,11 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   // own dedupe_key) — the wire body is this array, verbatim, with no envelope.
   const buffer: AnalyticsEvent[] = [];
   const seenKeys = new Set<string>();
+  // CS-0209: reference point for the inline batchIntervalMs force-flush check in
+  // track() below — starts at client construction (not null/never), so the interval
+  // countdown begins immediately rather than forcing a flush on the very first
+  // track() call (an elapsed-since-null "Infinity" would defeat batching entirely).
+  let lastFlushAtMs = now();
 
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let batchTimer: ReturnType<typeof setInterval> | null = null;
@@ -327,7 +341,15 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       buffer.push(event);
       trimBufferToCap();
 
-      if (buffer.length >= batchSize) {
+      // CS-0209: force a flush once batchIntervalMs has elapsed since the last flush
+      // attempt, even under batchSize — checked inline against now() here, not a
+      // timer, so this is what actually keeps a sub-batchSize caller's buffer from
+      // growing forever on serverless (the setInterval batchTimer below is a bonus
+      // for persistent processes, not the correctness guarantee — same relationship
+      // forceResendMs has to the heartbeat timer for health).
+      const elapsedSinceFlush = now() - lastFlushAtMs;
+      const intervalDue = batchIntervalMs > 0 && elapsedSinceFlush >= batchIntervalMs;
+      if (buffer.length >= batchSize || intervalDue) {
         void flush();
       }
     } catch {
@@ -337,6 +359,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
 
   async function doFlush(): Promise<void> {
     if (buffer.length === 0) return;
+    lastFlushAtMs = now();
     const batch = buffer.splice(0, buffer.length);
     try {
       // The wire body is a bare array of events — matches the server's
