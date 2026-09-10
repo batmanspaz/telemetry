@@ -67,6 +67,18 @@ export interface TelemetryConfig {
   /** Called when the client does something a caller would want to know about but cannot detect —
    *  today, collapsing two reports whose `checks` DIFFER. Optional; the client never requires it. */
   onWarn?: (message: string) => void;
+  /** Called synchronously, once per failed attempt, whenever a `transport.send()` call throws —
+   *  from `sendHealth` (the immediate/forced/heartbeat send path) or `doFlush` (the analytics
+   *  batch path). This is the ONLY way to learn a transport call failed other than diffing
+   *  `counters.dropped`/`health_dropped`/`events_dropped` before and after every call site, which
+   *  is what both intake (`snapshotDropped`/`alertNewDrops`, PR #182) and pagewright had no other
+   *  choice but to hand-roll (tasks.db #927/#922 — a swallowed 401 read as "success" for 7 days).
+   *  Fires on EVERY failed attempt, not just the first, so a caller can also observe an outage
+   *  clearing. Optional and purely additive: the client never requires it, never changes its
+   *  return value or throw behavior based on whether it's set, and any error the hook itself
+   *  throws is swallowed here — a broken hook must never break the client's own "never throws"
+   *  contract for existing callers. */
+  onTransportError?: (info: TransportErrorInfo) => void;
   /** Injectable clock (ms) for deterministic tests. */
   now?: () => number;
   /** Start the heartbeat + batch timers automatically (default true). */
@@ -84,6 +96,18 @@ export interface TelemetryConfig {
    *  sends), so no product call site needs to change. Defaults to a no-op —
    *  omitting this preserves exactly today's behavior. */
   keepAlive?: (p: Promise<unknown>) => void;
+}
+
+/** Payload handed to `onTransportError` on each failed `transport.send()` attempt. */
+export interface TransportErrorInfo {
+  /** Which transport call failed. */
+  kind: 'health' | 'event';
+  /** The ingest path that was called, e.g. '/ingest/health' or '/ingest/analytics'. */
+  path: string;
+  /** The error the transport threw, verbatim. */
+  error: unknown;
+  /** Number of events in the batch that failed to send (kind: 'event' only). */
+  count?: number;
 }
 
 export interface Counters {
@@ -180,6 +204,20 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   let lastSentChecksKey: string | null = null;
 
   const onWarn = config.onWarn;
+  const onTransportError = config.onTransportError;
+
+  /** Invokes onTransportError defensively — a hook that itself throws must never propagate out
+   *  of the client's own try/catch and break the "never throws" contract for callers who didn't
+   *  write the hook (e.g. a shared config object passed in by a different part of the app). */
+  function reportTransportError(info: TransportErrorInfo): void {
+    if (!onTransportError) return;
+    try {
+      onTransportError(info);
+    } catch {
+      /* the hook's own failure is not this client's problem to propagate */
+    }
+  }
+
   const checksKey = (checks?: HealthCheck[]): string =>
     JSON.stringify((checks ?? []).map((c) => [c.id, c.status]).sort());
 
@@ -244,8 +282,9 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       counters.health_sent++;
       lastSentStatus = report.status;
       lastSentAtMs = now();
-    } catch {
+    } catch (error) {
       bumpDropped('health');
+      reportTransportError({ kind: 'health', path: HEALTH_PATH, error });
     }
   }
 
@@ -366,13 +405,14 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       // AnalyticsBatch schema exactly (no wrapping envelope).
       await transport.send(ANALYTICS_PATH, batch);
       counters.events_sent += batch.length;
-    } catch {
+    } catch (error) {
       // Requeue (keys stay in seenKeys, so no re-buffering) and count the drop.
       // Each event's own dedupe_key means the eventual successful send is
       // idempotent downstream even after a retried batch.
       buffer.unshift(...batch);
       bumpDropped('event', batch.length);
       trimBufferToCap();
+      reportTransportError({ kind: 'event', path: ANALYTICS_PATH, error, count: batch.length });
     }
   }
 

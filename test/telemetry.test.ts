@@ -524,3 +524,132 @@ describe('suppression is visible, not silent', () => {
     await expect(t.reportHealth({ status: 'ok', checks: [{ id: 'b', status: 'pass' }] })).resolves.toBeUndefined();
   });
 });
+
+// tasks.db #927 — the 7-day CollageSoup outage (tasks.db #922) happened because sendHealth's
+// bare `catch { bumpDropped('health') }` gives a caller NO way to learn a transport call failed
+// except by diffing `counters.dropped` before/after every call — which is exactly the hand-rolled
+// workaround intake's PR #182 (`snapshotDropped`/`alertNewDrops`) had to invent because the client
+// itself offered nothing better. This hook is that "something better": a synchronous, structured
+// notification on the FIRST failure, same shape as the existing `onWarn` pattern above — additive,
+// optional, and must never change behavior for callers who don't opt in.
+describe('onTransportError', () => {
+  it('fires with kind "health" when sendHealth\'s transport throws, carrying the error', async () => {
+    const err = new Error('401 unauthorized');
+    const failing: Transport = {
+      async send() {
+        throw err;
+      },
+    };
+    const errors: any[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: failing, onTransportError: (info) => errors.push(info) });
+
+    await t.reportHealth({ status: 'ok' });
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0].kind).toBe('health');
+    expect(errors[0].path).toBe('/ingest/health');
+    expect(errors[0].error).toBe(err);
+  });
+
+  it('fires with kind "event" and a count when doFlush\'s transport throws', async () => {
+    const err = new Error('sink down');
+    const failing: Transport = {
+      async send() {
+        throw err;
+      },
+    };
+    const errors: any[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: failing, onTransportError: (info) => errors.push(info) });
+
+    t.track({ event: 'invoice.created', props: { n: 1 } });
+    t.track({ event: 'invoice.created', props: { n: 2 } });
+    await t.flush();
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0].kind).toBe('event');
+    expect(errors[0].path).toBe('/ingest/analytics');
+    expect(errors[0].error).toBe(err);
+    expect(errors[0].count).toBe(2);
+  });
+
+  it('fires on every failure, not just the first — a caller can detect an outage clearing', async () => {
+    const failing: Transport = {
+      async send() {
+        throw new Error('down');
+      },
+    };
+    const errors: any[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: failing, onTransportError: (info) => errors.push(info) });
+
+    await t.reportHealth({ status: 'ok' });
+    await t.reportHealth({ status: 'degraded' });
+
+    expect(errors).toHaveLength(2);
+  });
+
+  it('does NOT fire when the send succeeds', async () => {
+    const tx = recordingTransport();
+    const errors: any[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: tx, onTransportError: (info) => errors.push(info) });
+    await t.reportHealth({ status: 'ok' });
+    expect(errors).toHaveLength(0);
+  });
+
+  it('does NOT fire for a schema validation drop — only real transport failures', async () => {
+    const tx = recordingTransport();
+    const errors: any[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: tx, onTransportError: (info) => errors.push(info) });
+    // @ts-expect-error deliberately invalid status
+    await t.reportHealth({ status: 'exploded' });
+    expect(errors).toHaveLength(0);
+    expect(t.counters.dropped).toBeGreaterThanOrEqual(1); // still counted, just not via this hook
+  });
+
+  it('backward compatible: omitting onTransportError changes nothing — same drop-counting, same non-throwing contract', async () => {
+    const failing: Transport = {
+      async send() {
+        throw new Error('network down');
+      },
+    };
+    const t = createTelemetry({ ...baseConfig, transport: failing });
+    await expect(t.reportHealth({ status: 'ok' })).resolves.toBeUndefined();
+    expect(t.counters.dropped).toBeGreaterThanOrEqual(1);
+    expect(t.counters.health_dropped).toBeGreaterThanOrEqual(1);
+  });
+
+  it('a throwing onTransportError hook itself never breaks the client\'s "never throws" contract', async () => {
+    const failing: Transport = {
+      async send() {
+        throw new Error('network down');
+      },
+    };
+    const t = createTelemetry({
+      ...baseConfig,
+      transport: failing,
+      onTransportError: () => {
+        throw new Error('caller hook is broken');
+      },
+    });
+    await expect(t.reportHealth({ status: 'ok' })).resolves.toBeUndefined();
+    expect(t.counters.dropped).toBeGreaterThanOrEqual(1);
+  });
+
+  it('fires independently of onWarn — the two hooks cover different failure classes', async () => {
+    const failing: Transport = {
+      async send() {
+        throw new Error('down');
+      },
+    };
+    const warnings: string[] = [];
+    const errors: any[] = [];
+    const t = createTelemetry({
+      ...baseConfig,
+      transport: failing,
+      onWarn: (m) => warnings.push(m),
+      onTransportError: (info) => errors.push(info),
+    });
+    await t.reportHealth({ status: 'ok' });
+    expect(errors).toHaveLength(1);
+    expect(warnings).toHaveLength(0); // no suppression happened here, only a transport failure
+  });
+});

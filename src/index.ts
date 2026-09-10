@@ -34,4 +34,5 @@ export {
   type Counters,
   type HealthInput,
   type TrackInput,
+  type TransportErrorInfo,
 } from './telemetry.js';

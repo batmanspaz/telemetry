@@ -39,6 +39,20 @@ export function createTelemetry(config) {
      *  suppressed. */
     let lastSentChecksKey = null;
     const onWarn = config.onWarn;
+    const onTransportError = config.onTransportError;
+    /** Invokes onTransportError defensively — a hook that itself throws must never propagate out
+     *  of the client's own try/catch and break the "never throws" contract for callers who didn't
+     *  write the hook (e.g. a shared config object passed in by a different part of the app). */
+    function reportTransportError(info) {
+        if (!onTransportError)
+            return;
+        try {
+            onTransportError(info);
+        }
+        catch {
+            /* the hook's own failure is not this client's problem to propagate */
+        }
+    }
     const checksKey = (checks) => JSON.stringify((checks ?? []).map((c) => [c.id, c.status]).sort());
     // Buffer holds fully-validated AnalyticsEvent objects (each already carries its
     // own dedupe_key) — the wire body is this array, verbatim, with no envelope.
@@ -97,8 +111,9 @@ export function createTelemetry(config) {
             lastSentStatus = report.status;
             lastSentAtMs = now();
         }
-        catch {
+        catch (error) {
             bumpDropped('health');
+            reportTransportError({ kind: 'health', path: HEALTH_PATH, error });
         }
     }
     async function doReportHealth(input) {
@@ -212,13 +227,14 @@ export function createTelemetry(config) {
             await transport.send(ANALYTICS_PATH, batch);
             counters.events_sent += batch.length;
         }
-        catch {
+        catch (error) {
             // Requeue (keys stay in seenKeys, so no re-buffering) and count the drop.
             // Each event's own dedupe_key means the eventual successful send is
             // idempotent downstream even after a retried batch.
             buffer.unshift(...batch);
             bumpDropped('event', batch.length);
             trimBufferToCap();
+            reportTransportError({ kind: 'event', path: ANALYTICS_PATH, error, count: batch.length });
         }
     }
     // Same keepAlive registration as reportHealth() above, for the same reason.
