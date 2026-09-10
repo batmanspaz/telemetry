@@ -52,6 +52,18 @@ export interface TelemetryConfig {
     /** Called when the client does something a caller would want to know about but cannot detect —
      *  today, collapsing two reports whose `checks` DIFFER. Optional; the client never requires it. */
     onWarn?: (message: string) => void;
+    /** Called synchronously, once per failed attempt, whenever a `transport.send()` call throws —
+     *  from `sendHealth` (the immediate/forced/heartbeat send path) or `doFlush` (the analytics
+     *  batch path). This is the ONLY way to learn a transport call failed other than diffing
+     *  `counters.dropped`/`health_dropped`/`events_dropped` before and after every call site, which
+     *  is what both intake (`snapshotDropped`/`alertNewDrops`, PR #182) and pagewright had no other
+     *  choice but to hand-roll (tasks.db #927/#922 — a swallowed 401 read as "success" for 7 days).
+     *  Fires on EVERY failed attempt, not just the first, so a caller can also observe an outage
+     *  clearing. Optional and purely additive: the client never requires it, never changes its
+     *  return value or throw behavior based on whether it's set, and any error the hook itself
+     *  throws is swallowed here — a broken hook must never break the client's own "never throws"
+     *  contract for existing callers. */
+    onTransportError?: (info: TransportErrorInfo) => void;
     /** Injectable clock (ms) for deterministic tests. */
     now?: () => number;
     /** Start the heartbeat + batch timers automatically (default true). */
@@ -70,6 +82,32 @@ export interface TelemetryConfig {
      *  omitting this preserves exactly today's behavior. */
     keepAlive?: (p: Promise<unknown>) => void;
 }
+/** Payload handed to `onTransportError` on each failed `transport.send()` attempt. A true
+ *  discriminated union on `kind` — `count` is REQUIRED on the 'event' variant (every failed
+ *  analytics flush has a batch size) and does not exist at all on 'health' (a health send is
+ *  always exactly one report). Narrowing on `info.kind === 'event'` removes `undefined` from
+ *  `info.count`'s type with no cast or null-check needed. */
+export type TransportErrorInfo = {
+    /** A failed `sendHealth` call. */
+    kind: 'health';
+    /** The ingest path that was called, e.g. '/ingest/health'. */
+    path: string;
+    /** The error the transport threw, verbatim — raw and UNSANITIZED (it has not passed
+     *  through this client's own `scanForPii` gate the way tracked event props do). Redact
+     *  or scrub before logging/forwarding it anywhere PII-sensitive. */
+    error: unknown;
+} | {
+    /** A failed `doFlush` (analytics batch) call. */
+    kind: 'event';
+    /** The ingest path that was called, e.g. '/ingest/analytics'. */
+    path: string;
+    /** The error the transport threw, verbatim — raw and UNSANITIZED (it has not passed
+     *  through this client's own `scanForPii` gate the way tracked event props do). Redact
+     *  or scrub before logging/forwarding it anywhere PII-sensitive. */
+    error: unknown;
+    /** Number of events in the batch that failed to send. */
+    count: number;
+};
 export interface Counters {
     health_sent: number;
     health_dropped: number;

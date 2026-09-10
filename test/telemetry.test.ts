@@ -1,5 +1,29 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { createTelemetry, type Transport, type AnalyticsEvent } from '../src/index.js';
+import { createTelemetry, type Transport, type AnalyticsEvent, type TransportErrorInfo } from '../src/index.js';
+
+/** Captures Node-level 'unhandledRejection' events for the duration of one test, so a hook's
+ *  own async rejection escaping the client can be proven absent (or present) directly, not
+ *  inferred from vitest's own crash/report behavior. Always detach in a `finally`. */
+function captureUnhandledRejections(): { reasons: unknown[]; stop: () => void } {
+  const reasons: unknown[] = [];
+  const onUnhandledRejection = (reason: unknown) => {
+    reasons.push(reason);
+  };
+  process.on('unhandledRejection', onUnhandledRejection);
+  return {
+    reasons,
+    stop: () => process.off('unhandledRejection', onUnhandledRejection),
+  };
+}
+
+/** Give any already-scheduled promise rejections a chance to surface as 'unhandledRejection'
+ *  before we assert on what was captured — the event fires on a later microtask/macrotask
+ *  turn, not synchronously when the promise rejects. */
+async function flushMicrotasksAndTimers(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await new Promise<void>((resolve) => setTimeout(resolve, 10));
+}
 
 interface Recorded {
   path: string;
@@ -522,5 +546,305 @@ describe('suppression is visible, not silent', () => {
     const t = createTelemetry({ ...baseConfig, transport: tx });
     await t.reportHealth({ status: 'ok', checks: [{ id: 'a', status: 'pass' }] });
     await expect(t.reportHealth({ status: 'ok', checks: [{ id: 'b', status: 'pass' }] })).resolves.toBeUndefined();
+  });
+});
+
+// tasks.db #927 — the 7-day CollageSoup outage (tasks.db #922) happened because sendHealth's
+// bare `catch { bumpDropped('health') }` gives a caller NO way to learn a transport call failed
+// except by diffing `counters.dropped` before/after every call — which is exactly the hand-rolled
+// workaround intake's PR #182 (`snapshotDropped`/`alertNewDrops`) had to invent because the client
+// itself offered nothing better. This hook is that "something better": a synchronous, structured
+// notification on EVERY failure (not just the first — see the "fires on every failure" test
+// below), same shape as the existing `onWarn` pattern above — additive, optional, and must
+// never change behavior for callers who don't opt in.
+describe('onTransportError', () => {
+  it('fires with kind "health" when sendHealth\'s transport throws, carrying the error', async () => {
+    const err = new Error('401 unauthorized');
+    const failing: Transport = {
+      async send() {
+        throw err;
+      },
+    };
+    const errors: any[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: failing, onTransportError: (info) => errors.push(info) });
+
+    await t.reportHealth({ status: 'ok' });
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0].kind).toBe('health');
+    expect(errors[0].path).toBe('/ingest/health');
+    expect(errors[0].error).toBe(err);
+  });
+
+  it('fires with kind "event" and a count when doFlush\'s transport throws', async () => {
+    const err = new Error('sink down');
+    const failing: Transport = {
+      async send() {
+        throw err;
+      },
+    };
+    const errors: any[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: failing, onTransportError: (info) => errors.push(info) });
+
+    t.track({ event: 'invoice.created', props: { n: 1 } });
+    t.track({ event: 'invoice.created', props: { n: 2 } });
+    await t.flush();
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0].kind).toBe('event');
+    expect(errors[0].path).toBe('/ingest/analytics');
+    expect(errors[0].error).toBe(err);
+    expect(errors[0].count).toBe(2);
+  });
+
+  it('fires on every failure, not just the first — health path', async () => {
+    const failing: Transport = {
+      async send() {
+        throw new Error('down');
+      },
+    };
+    const errors: any[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: failing, onTransportError: (info) => errors.push(info) });
+
+    await t.reportHealth({ status: 'ok' });
+    await t.reportHealth({ status: 'degraded' });
+
+    expect(errors).toHaveLength(2);
+  });
+
+  it('fires on every failure, not just the first — analytics flush path (Fable finding #2)', async () => {
+    const failing: Transport = {
+      async send() {
+        throw new Error('sink down');
+      },
+    };
+    const errors: any[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: failing, onTransportError: (info) => errors.push(info) });
+
+    t.track({ event: 'invoice.created', props: { n: 1 } });
+    await t.flush(); // failure #1 — 1 event
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0].kind).toBe('event');
+    expect(errors[0].count).toBe(1);
+
+    // A failed batch is requeued (buffer.unshift), so failure #2's batch carries the 1
+    // requeued event PLUS the 2 newly tracked ones — 3, not 2. This is correct retry
+    // behavior, not a bug; asserted explicitly so the requeue semantics don't get lost.
+    t.track({ event: 'invoice.created', props: { n: 2 } });
+    t.track({ event: 'invoice.created', props: { n: 3 } });
+    await t.flush(); // failure #2 — 1 requeued + 2 new = 3 events
+
+    expect(errors).toHaveLength(2);
+    expect(errors[1].kind).toBe('event');
+    expect(errors[1].count).toBe(3);
+  });
+
+  it('does NOT fire when the send succeeds', async () => {
+    const tx = recordingTransport();
+    const errors: any[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: tx, onTransportError: (info) => errors.push(info) });
+    await t.reportHealth({ status: 'ok' });
+    expect(errors).toHaveLength(0);
+  });
+
+  it('does NOT fire for a schema validation drop — only real transport failures', async () => {
+    const tx = recordingTransport();
+    const errors: any[] = [];
+    const t = createTelemetry({ ...baseConfig, transport: tx, onTransportError: (info) => errors.push(info) });
+    // @ts-expect-error deliberately invalid status
+    await t.reportHealth({ status: 'exploded' });
+    expect(errors).toHaveLength(0);
+    expect(t.counters.dropped).toBeGreaterThanOrEqual(1); // still counted, just not via this hook
+  });
+
+  it('backward compatible: omitting onTransportError changes nothing — same drop-counting, same non-throwing contract', async () => {
+    const failing: Transport = {
+      async send() {
+        throw new Error('network down');
+      },
+    };
+    const t = createTelemetry({ ...baseConfig, transport: failing });
+    await expect(t.reportHealth({ status: 'ok' })).resolves.toBeUndefined();
+    expect(t.counters.dropped).toBeGreaterThanOrEqual(1);
+    expect(t.counters.health_dropped).toBeGreaterThanOrEqual(1);
+  });
+
+  // A weak version of this test (asserting `dropped` was merely >= 1) passed even with
+  // `reportTransportError`'s own try/catch deleted entirely, because doReportHealth's
+  // PRE-EXISTING outer try/catch masked the hook's throw and bumped `dropped` a SECOND time
+  // instead (dropped === 2). Exact counts are what actually prove the hook's own try/catch is
+  // doing the swallowing, not some other catch further up the call stack.
+  it('a SYNC-throwing onTransportError hook never breaks the "never throws" contract — health path, exact drop count', async () => {
+    const failing: Transport = {
+      async send() {
+        throw new Error('network down');
+      },
+    };
+    const t = createTelemetry({
+      ...baseConfig,
+      transport: failing,
+      onTransportError: () => {
+        throw new Error('caller hook is broken');
+      },
+    });
+    await expect(t.reportHealth({ status: 'ok' })).resolves.toBeUndefined();
+    expect(t.counters.dropped).toBe(1);
+    expect(t.counters.health_dropped).toBe(1);
+  });
+
+  it('a SYNC-throwing onTransportError hook never breaks the "never throws" contract — flush path, exact drop count', async () => {
+    const failing: Transport = {
+      async send() {
+        throw new Error('sink down');
+      },
+    };
+    const t = createTelemetry({
+      ...baseConfig,
+      transport: failing,
+      onTransportError: () => {
+        throw new Error('caller hook is broken');
+      },
+    });
+    t.track({ event: 'invoice.created', props: { n: 1 } });
+    await expect(t.flush()).resolves.toBeUndefined();
+    expect(t.counters.events_dropped).toBe(1);
+  });
+
+  // THE core gap (tasks.db #927 follow-up): `onTransportError?: (info) => void` type-checks
+  // fine against an `async` function — TS's void-return assignability allows any return value,
+  // including a rejected Promise. A sync try/catch around the call to the hook does NOT catch
+  // that rejection (nothing throws synchronously — the hook returns a Promise that rejects
+  // later), so it must be handled explicitly or it escapes as a Node-level unhandled promise
+  // rejection, which can crash the process. These are the tests that must be RED against the
+  // pre-fix code (the assertion on `unhandled` fails, or is masked by a vitest-level crash
+  // report — either way, this is NOT a clean pass before the fix).
+  it('an ASYNC (Promise-rejecting) onTransportError hook does not escape as an unhandled rejection — health path', async () => {
+    const failing: Transport = {
+      async send() {
+        throw new Error('401 unauthorized');
+      },
+    };
+    const capture = captureUnhandledRejections();
+    try {
+      const t = createTelemetry({
+        ...baseConfig,
+        transport: failing,
+        onTransportError: async () => {
+          throw new Error('hook blew up asynchronously');
+        },
+      });
+      await expect(t.reportHealth({ status: 'ok' })).resolves.toBeUndefined();
+      expect(t.counters.dropped).toBe(1);
+      await flushMicrotasksAndTimers();
+      expect(capture.reasons).toHaveLength(0);
+    } finally {
+      capture.stop();
+    }
+  });
+
+  it('an ASYNC (Promise-rejecting) onTransportError hook does not escape as an unhandled rejection — flush path', async () => {
+    const failing: Transport = {
+      async send() {
+        throw new Error('sink down');
+      },
+    };
+    const capture = captureUnhandledRejections();
+    try {
+      const t = createTelemetry({
+        ...baseConfig,
+        transport: failing,
+        onTransportError: async () => {
+          throw new Error('hook blew up asynchronously');
+        },
+      });
+      t.track({ event: 'invoice.created', props: { n: 1 } });
+      await expect(t.flush()).resolves.toBeUndefined();
+      expect(t.counters.events_dropped).toBe(1);
+      await flushMicrotasksAndTimers();
+      expect(capture.reasons).toHaveLength(0);
+    } finally {
+      capture.stop();
+    }
+  });
+
+  it('an ASYNC (Promise-rejecting) onTransportError hook does not escape as an unhandled rejection — heartbeat timer path', async () => {
+    vi.useFakeTimers();
+    const capture = captureUnhandledRejections();
+    try {
+      const failing: Transport = {
+        async send() {
+          throw new Error('down');
+        },
+      };
+      const t = createTelemetry({
+        ...baseConfig,
+        autoStart: true,
+        heartbeatMs: 1000,
+        transport: failing,
+        onTransportError: async () => {
+          throw new Error('hook blew up asynchronously');
+        },
+      });
+      await t.reportHealth({ status: 'ok' }); // seeds lastInput so the heartbeat has something to resend
+      await vi.advanceTimersByTimeAsync(1500); // one heartbeat tick -> sendHealth called directly, not via doReportHealth
+      t.stop();
+      vi.useRealTimers(); // flushMicrotasksAndTimers() needs a REAL setTimeout to actually elapse
+      await flushMicrotasksAndTimers();
+      expect(capture.reasons).toHaveLength(0);
+    } finally {
+      capture.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it('fires independently of onWarn — the two hooks cover different failure classes', async () => {
+    const failing: Transport = {
+      async send() {
+        throw new Error('down');
+      },
+    };
+    const warnings: string[] = [];
+    const errors: any[] = [];
+    const t = createTelemetry({
+      ...baseConfig,
+      transport: failing,
+      onWarn: (m) => warnings.push(m),
+      onTransportError: (info) => errors.push(info),
+    });
+    await t.reportHealth({ status: 'ok' });
+    expect(errors).toHaveLength(1);
+    expect(warnings).toHaveLength(0); // no suppression happened here, only a transport failure
+  });
+
+  // Sonnet finding #2: TransportErrorInfo was a single interface with `count?: number` on BOTH
+  // variants, not a true discriminated union — so `count` was optional even when `kind === 'event'`
+  // and TS could not narrow it. This is primarily a `tsc`-time assertion: the lines below only
+  // type-check at all if `count` is required (not optional) on the 'event' variant and absent
+  // from the 'health' variant, and if narrowing on `kind === 'event'` actually removes `undefined`
+  // from `info.count`'s type without a cast or a runtime null-check.
+  it('TransportErrorInfo is a true discriminated union — count is required and narrowed only on kind "event"', () => {
+    const eventInfo: TransportErrorInfo = { kind: 'event', path: '/ingest/analytics', error: new Error('x'), count: 3 };
+    const healthInfo: TransportErrorInfo = { kind: 'health', path: '/ingest/health', error: new Error('y') };
+
+    function narrowedCount(info: TransportErrorInfo): number | null {
+      if (info.kind === 'event') {
+        // No `?? 0`, no `as number`, no `!` — this only compiles if narrowing genuinely
+        // removed `undefined` from info.count's type.
+        const count: number = info.count;
+        return count;
+      }
+      return null;
+    }
+
+    expect(narrowedCount(eventInfo)).toBe(3);
+    expect(narrowedCount(healthInfo)).toBeNull();
+
+    // @ts-expect-error — the 'health' variant must not accept a `count` field at all.
+    const invalidHealth: TransportErrorInfo = { kind: 'health', path: '/ingest/health', error: new Error('z'), count: 1 };
+    // @ts-expect-error — the 'event' variant must REQUIRE `count`, not allow omitting it.
+    const invalidEvent: TransportErrorInfo = { kind: 'event', path: '/ingest/analytics', error: new Error('z') };
+    expect(invalidHealth.kind).toBe('health');
+    expect(invalidEvent.kind).toBe('event');
   });
 });

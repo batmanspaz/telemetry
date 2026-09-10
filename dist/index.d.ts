@@ -3,5 +3,5 @@ export { hash } from './hash.js';
 export { isStale } from './stale.js';
 export { looksLikePii, scanForPii } from './pii.js';
 export { noopTransport, httpTransport, type Transport, type HttpTransportConfig, } from './transport.js';
-export { createTelemetry, type Telemetry, type TelemetryConfig, type Counters, type HealthInput, type TrackInput, } from './telemetry.js';
+export { createTelemetry, type Telemetry, type TelemetryConfig, type Counters, type HealthInput, type TrackInput, type TransportErrorInfo, } from './telemetry.js';
 //# sourceMappingURL=index.d.ts.map
