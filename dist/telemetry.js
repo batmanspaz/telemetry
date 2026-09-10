@@ -40,17 +40,38 @@ export function createTelemetry(config) {
     let lastSentChecksKey = null;
     const onWarn = config.onWarn;
     const onTransportError = config.onTransportError;
-    /** Invokes onTransportError defensively — a hook that itself throws must never propagate out
-     *  of the client's own try/catch and break the "never throws" contract for callers who didn't
-     *  write the hook (e.g. a shared config object passed in by a different part of the app). */
+    /** Invokes onTransportError defensively — a hook that itself throws (or, if async, rejects)
+     *  must never propagate out of the client's own try/catch and break the "never throws"
+     *  contract for callers who didn't write the hook (e.g. a shared config object passed in by
+     *  a different part of the app).
+     *
+     *  The declared hook type is `(info: TransportErrorInfo) => void`, but TS's void-return-type
+     *  assignability lets a caller pass an ASYNC function — the obvious real use case being a
+     *  Slack/PagerDuty alerting hook. A `try/catch` around the call only catches a SYNCHRONOUS
+     *  throw; an async function that throws doesn't throw synchronously, it returns an
+     *  already-rejecting Promise, which the try/catch here would let sail right past uncaught. If
+     *  nothing ever attaches a rejection handler to that Promise, Node surfaces it as an
+     *  'unhandledRejection' — a real process-crash risk under default Node behavior. So: call the
+     *  hook inside try/catch for the sync case, AND, if what comes back looks thenable, attach a
+     *  no-op `.catch()` to it for the async case. Both paths are exercised in
+     *  test/telemetry.test.ts's `onTransportError` suite, including a scoped
+     *  `process.on('unhandledRejection', ...)` listener that proves nothing escapes. */
     function reportTransportError(info) {
         if (!onTransportError)
             return;
         try {
-            onTransportError(info);
+            // Cast past the declared `=> void` signature to observe the real return value —
+            // TypeScript allows a caller to pass an async (Promise-returning) function against a
+            // `=> void` hook type, so at runtime this may genuinely be a thenable.
+            const result = onTransportError(info);
+            if (result != null && typeof result.then === 'function') {
+                Promise.resolve(result).catch(() => {
+                    /* the hook's own async failure is not this client's problem to propagate */
+                });
+            }
         }
         catch {
-            /* the hook's own failure is not this client's problem to propagate */
+            /* the hook's own synchronous failure is not this client's problem to propagate */
         }
     }
     const checksKey = (checks) => JSON.stringify((checks ?? []).map((c) => [c.id, c.status]).sort());

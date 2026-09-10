@@ -170,6 +170,7 @@ telemetry.stop();   // clears heartbeat + batch timers (idempotent)
 | `looksLikePii(value)`, `scanForPii(event)` | privacy guard utilities |
 | `noopTransport` | default mock transport |
 | `httpTransport({ baseUrl, hmacKey, fetch? })` | HMAC-signed HTTP ingest transport |
+| `TransportErrorInfo` | payload passed to the optional `onTransportError` config hook — fires synchronously on every failed `transport.send()` attempt (`{ kind: 'health', path, error }` or `{ kind: 'event', path, error, count }`); `error` is raw/unsanitized, redact before logging |
 
 ## Transport seam
 
@@ -186,7 +187,7 @@ Ship `noopTransport` (default mock) and `httpTransport` (HMAC-SHA256 signed, inj
 `keepAlive registered synchronously on reportHealth/flush + internal heartbeat/batch sends`.
 
 ```bash
-pnpm test   # 55 tests green
+pnpm test   # 78 tests green
 ```
 
 No secrets in code — the HMAC key is sourced from config/env at runtime.

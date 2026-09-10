@@ -82,17 +82,32 @@ export interface TelemetryConfig {
      *  omitting this preserves exactly today's behavior. */
     keepAlive?: (p: Promise<unknown>) => void;
 }
-/** Payload handed to `onTransportError` on each failed `transport.send()` attempt. */
-export interface TransportErrorInfo {
-    /** Which transport call failed. */
-    kind: 'health' | 'event';
-    /** The ingest path that was called, e.g. '/ingest/health' or '/ingest/analytics'. */
+/** Payload handed to `onTransportError` on each failed `transport.send()` attempt. A true
+ *  discriminated union on `kind` — `count` is REQUIRED on the 'event' variant (every failed
+ *  analytics flush has a batch size) and does not exist at all on 'health' (a health send is
+ *  always exactly one report). Narrowing on `info.kind === 'event'` removes `undefined` from
+ *  `info.count`'s type with no cast or null-check needed. */
+export type TransportErrorInfo = {
+    /** A failed `sendHealth` call. */
+    kind: 'health';
+    /** The ingest path that was called, e.g. '/ingest/health'. */
     path: string;
-    /** The error the transport threw, verbatim. */
+    /** The error the transport threw, verbatim — raw and UNSANITIZED (it has not passed
+     *  through this client's own `scanForPii` gate the way tracked event props do). Redact
+     *  or scrub before logging/forwarding it anywhere PII-sensitive. */
     error: unknown;
-    /** Number of events in the batch that failed to send (kind: 'event' only). */
-    count?: number;
-}
+} | {
+    /** A failed `doFlush` (analytics batch) call. */
+    kind: 'event';
+    /** The ingest path that was called, e.g. '/ingest/analytics'. */
+    path: string;
+    /** The error the transport threw, verbatim — raw and UNSANITIZED (it has not passed
+     *  through this client's own `scanForPii` gate the way tracked event props do). Redact
+     *  or scrub before logging/forwarding it anywhere PII-sensitive. */
+    error: unknown;
+    /** Number of events in the batch that failed to send. */
+    count: number;
+};
 export interface Counters {
     health_sent: number;
     health_dropped: number;
