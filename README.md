@@ -169,7 +169,7 @@ telemetry.stop();   // clears heartbeat + batch timers (idempotent)
 | `hash(value)` | one-way SHA-256 for actor/sensitive ids |
 | `looksLikePii(value)`, `scanForPii(event)` | privacy guard utilities |
 | `noopTransport` | default mock transport |
-| `httpTransport({ baseUrl, hmacKey, fetch? })` | HMAC-signed HTTP ingest transport |
+| `httpTransport({ baseUrl, hmacKey, fetch?, timeoutMs? })` | HMAC-signed HTTP ingest transport |
 | `TransportErrorInfo` | payload passed to the optional `onTransportError` config hook — fires synchronously on every failed `transport.send()` attempt (`{ kind: 'health', path, error }` or `{ kind: 'event', path, error, count }`); `error` is raw/unsanitized, redact before logging |
 
 ## Transport seam
@@ -178,6 +178,13 @@ The client never touches the network directly — it calls `transport.send(path,
 Ship `noopTransport` (default mock) and `httpTransport` (HMAC-SHA256 signed, injectable
 `fetch`). CF-Worker products can supply a service-binding transport implementing the same
 `Transport` interface.
+
+`httpTransport` bounds every outbound POST with an HTTP timeout (default **5000ms**, override
+via `timeoutMs`) — tasks.db #1089. Without it, a hung request (dead connection, a server that
+never answers) blocked the calling module's `reportHealth()`/`track()` indefinitely. On expiry
+the request is aborted (`AbortController`) and `send()` rejects, so it flows through the
+existing drop-counting/`onTransportError` path like any other transport failure — a timeout is
+observable, never a silent hang or a silent swallow.
 
 ## Phase-0 invariants (tested)
 

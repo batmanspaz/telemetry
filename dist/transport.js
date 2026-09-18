@@ -25,6 +25,7 @@ export function httpTransport(config) {
     }
     const base = config.baseUrl.replace(/\/+$/, '');
     const now = config.now ?? Date.now;
+    const timeoutMs = config.timeoutMs ?? 5_000;
     return {
         async send(path, body) {
             const payload = JSON.stringify(body);
@@ -32,19 +33,39 @@ export function httpTransport(config) {
             const signature = createHmac('sha256', config.hmacKey)
                 .update(`${config.product}.${ts}.${payload}`)
                 .digest('hex');
-            const res = await doFetch(`${base}${path}`, {
-                method: 'POST',
-                headers: {
-                    'content-type': 'application/json',
-                    'X-PC-Product': config.product,
-                    'X-PC-Timestamp': ts,
-                    'X-PC-Signature': signature,
-                    ...config.headers,
-                },
-                body: payload,
+            // AbortController drives real cancellation of the underlying request.
+            // The `timeoutPromise` leg is what actually bounds `send()`'s own
+            // promise even if a mock/edge-case fetch implementation ignores the
+            // abort signal entirely (a genuinely black-holed connection never
+            // settles on its own) — the abort() call remains best-effort real
+            // cancellation for a fetch that DOES honor it.
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), timeoutMs);
+            const timeoutPromise = new Promise((_, reject) => {
+                controller.signal.addEventListener('abort', () => reject(new Error(`telemetry ingest ${path} timed out after ${timeoutMs}ms`)), { once: true });
             });
-            if (!res.ok) {
-                throw new Error(`telemetry ingest ${path} failed: ${res.status}`);
+            try {
+                const res = await Promise.race([
+                    doFetch(`${base}${path}`, {
+                        method: 'POST',
+                        headers: {
+                            'content-type': 'application/json',
+                            'X-PC-Product': config.product,
+                            'X-PC-Timestamp': ts,
+                            'X-PC-Signature': signature,
+                            ...config.headers,
+                        },
+                        body: payload,
+                        signal: controller.signal,
+                    }),
+                    timeoutPromise,
+                ]);
+                if (!res.ok) {
+                    throw new Error(`telemetry ingest ${path} failed: ${res.status}`);
+                }
+            }
+            finally {
+                clearTimeout(timer);
             }
         },
     };
