@@ -25,6 +25,18 @@ export interface HttpTransportConfig {
     headers?: Record<string, string>;
     /** Injectable clock (ms), for deterministic tests. */
     now?: () => number;
+    /** HTTP timeout for each outbound POST, in ms (tasks.db #1089). Without this,
+     *  a hung request (dead TCP connection, a server that never answers) blocks
+     *  the calling module's `reportHealth()`/`track()` indefinitely — there is no
+     *  other bound anywhere in the client. On expiry the request is aborted and
+     *  `send()` rejects, so the caller's existing catch path (`sendHealth`/
+     *  `doFlush` in telemetry.ts) counts it as a drop and, if `onTransportError`
+     *  is configured, reports it — a timeout is observable, never a silent hang
+     *  or a silent swallow. Default 5000ms, matching the existing
+     *  AbortController+setTimeout convention already used for outbound HTTP
+     *  elsewhere on this platform (perfectcity/health-monitor/rebuild/src/uptime.ts
+     *  TIMEOUT_MS). */
+    timeoutMs?: number;
 }
 /**
  * HTTP transport for the signed ingest endpoints. Matches the real deployed
