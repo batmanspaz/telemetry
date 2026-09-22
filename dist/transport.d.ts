@@ -37,6 +37,33 @@ export interface HttpTransportConfig {
      *  elsewhere on this platform (perfectcity/health-monitor/rebuild/src/uptime.ts
      *  TIMEOUT_MS). */
     timeoutMs?: number;
+    /** Number of ADDITIONAL attempts after the first failed send, before finally
+     *  throwing (tasks.db #1095 — CollageSoup, 2026-09-21: four HTTP 401s against
+     *  hx-health-ingest in one day, escalating to 92 events dropped in a single
+     *  `health-resend-cron` tick, with zero retry anywhere in this client — a
+     *  transient blip became PERMANENT data loss purely because nothing ever
+     *  retried). Default 0 — every existing consumer of this shared package keeps
+     *  today's exact single-attempt behavior until it explicitly opts in; a
+     *  global default-on change has portfolio-wide blast radius (every harness
+     *  tenant, every product) this incident alone does not justify taking on
+     *  unreviewed. Each retry recomputes `ts`/signature fresh (see `send` below)
+     *  — a stale replayed timestamp must never be what finally lands. */
+    retries?: number;
+    /** Base delay in ms for exponential backoff between retry attempts (default
+     *  250ms, doubling each attempt: 250ms, 500ms, 1000ms, ...). Only consulted
+     *  when `retries` > 0. */
+    retryBaseDelayMs?: number;
+    /** Injectable delay, defaults to a real `setTimeout`-based sleep. Tests pass
+     *  a no-op (or one that also advances an injected clock) to run instantly
+     *  and deterministically. */
+    sleep?: (ms: number) => Promise<void>;
+    /** HTTP status codes that are NEVER retried even when `retries` > 0 — the
+     *  failure is deterministic (the request itself is malformed), so a retry
+     *  would just waste an attempt and add latency with no chance of success.
+     *  Default: [400]. 401/403/5xx and network-level failures (fetch throwing)
+     *  ARE retried by default, since those can be transient (a brief clock-skew
+     *  edge, a momentary ingest-side hiccup, a dropped connection). */
+    noRetryStatusCodes?: number[];
 }
 /**
  * HTTP transport for the signed ingest endpoints. Matches the real deployed
