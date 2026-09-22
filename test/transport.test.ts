@@ -58,6 +58,31 @@ describe('httpTransport', () => {
     await expect(t.send('/ingest/analytics', {})).rejects.toThrow(/503/);
   });
 
+  it('includes the response body text in the thrown error when the mock/real Response exposes .text() (tasks.db #1095 — a 401 reason code like "unauthorized: signature mismatch" was previously discarded entirely, leaving no way to diagnose WHY an ingest call was rejected)', async () => {
+    const fakeFetch = vi.fn(
+      async () =>
+        ({ ok: false, status: 401, text: async () => 'unauthorized: timestamp outside replay window' }) as Response,
+    );
+    const t = httpTransport({
+      baseUrl: 'https://ingest.example.com',
+      product: 'billing',
+      hmacKey: 'k',
+      fetch: fakeFetch as unknown as typeof fetch,
+    });
+    await expect(t.send('/ingest/health', {})).rejects.toThrow(/401.*unauthorized: timestamp outside replay window/);
+  });
+
+  it('still throws cleanly when the Response has no .text() method (defensive — some mocks/edge runtimes omit it)', async () => {
+    const fakeFetch = vi.fn(async () => ({ ok: false, status: 503 }) as Response);
+    const t = httpTransport({
+      baseUrl: 'https://ingest.example.com',
+      product: 'billing',
+      hmacKey: 'k',
+      fetch: fakeFetch as unknown as typeof fetch,
+    });
+    await expect(t.send('/ingest/health', {})).rejects.toThrow(/503/);
+  });
+
   it('does not leak the hmac key into the request body or headers', async () => {
     let seen = '';
     const fakeFetch = vi.fn(async (_url: string, init: RequestInit) => {
@@ -173,6 +198,134 @@ describe('httpTransport', () => {
         timeoutMs: 5_000,
       });
       await expect(t.send('/ingest/analytics', {})).rejects.toThrow(/503/);
+    });
+  });
+
+  // tasks.db #1095 (CollageSoup 2026-09-21 — four HTTP 401s against hx-health-ingest in one day,
+  // escalating from a handful of events to 92 in a single `health-resend-cron` tick). Root cause
+  // of the individual 401s could not be pinned down deterministically (key pair confirmed
+  // unchanged, endpoint confirmed reachable) — this is the bounded safety net regardless: a
+  // TRANSIENT failure (a blip, a brief clock-skew/timing edge, a momentary ingest-side hiccup)
+  // must not silently become PERMANENT data loss just because nothing ever retried. Opt-in via
+  // `retries` (default 0 — unchanged behavior for every other consumer of this shared package
+  // until they choose to opt in; a global default-on change has portfolio-wide blast radius this
+  // incident does not justify taking on unreviewed).
+  describe('retry-with-backoff (tasks.db #1095)', () => {
+    it('defaults to zero retries — a single failed attempt still throws immediately (existing behavior, unchanged)', async () => {
+      const fakeFetch = vi.fn(async () => ({ ok: false, status: 401 }) as Response);
+      const t = httpTransport({
+        baseUrl: 'https://ingest.example.com',
+        product: 'billing',
+        hmacKey: 'k',
+        fetch: fakeFetch as unknown as typeof fetch,
+      });
+      await expect(t.send('/ingest/health', {})).rejects.toThrow(/401/);
+      expect(fakeFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries a failing send up to `retries` additional times, with backoff, before giving up', async () => {
+      let calls = 0;
+      const fakeFetch = vi.fn(async () => {
+        calls++;
+        return { ok: false, status: 401 } as Response;
+      });
+      const sleeps: number[] = [];
+      const t = httpTransport({
+        baseUrl: 'https://ingest.example.com',
+        product: 'billing',
+        hmacKey: 'k',
+        fetch: fakeFetch as unknown as typeof fetch,
+        retries: 2,
+        retryBaseDelayMs: 100,
+        sleep: async (ms) => {
+          sleeps.push(ms);
+        },
+      });
+      await expect(t.send('/ingest/health', {})).rejects.toThrow(/401/);
+      expect(calls).toBe(3); // 1 initial attempt + 2 retries
+      expect(sleeps).toEqual([100, 200]); // exponential backoff between attempts, none after the last
+    });
+
+    it('succeeds without exhausting retries once a retry attempt lands ok', async () => {
+      let calls = 0;
+      const fakeFetch = vi.fn(async () => {
+        calls++;
+        if (calls < 3) return { ok: false, status: 401 } as Response;
+        return { ok: true, status: 200 } as Response;
+      });
+      const t = httpTransport({
+        baseUrl: 'https://ingest.example.com',
+        product: 'billing',
+        hmacKey: 'k',
+        fetch: fakeFetch as unknown as typeof fetch,
+        retries: 3,
+        retryBaseDelayMs: 0,
+        sleep: async () => {},
+      });
+      await expect(t.send('/ingest/health', {})).resolves.toBeUndefined();
+      expect(calls).toBe(3);
+    });
+
+    it('recomputes a fresh timestamp + signature on every retry attempt (a stale replayed ts must never be what finally lands)', async () => {
+      let calls = 0;
+      let clock = Date.parse('2026-09-21T00:00:00.000Z');
+      const seenTimestamps: string[] = [];
+      const fakeFetch = vi.fn(async (_url: string, init: RequestInit) => {
+        calls++;
+        seenTimestamps.push((init.headers as Record<string, string>)['X-PC-Timestamp']!);
+        if (calls < 2) return { ok: false, status: 401 } as Response;
+        return { ok: true, status: 200 } as Response;
+      });
+      const t = httpTransport({
+        baseUrl: 'https://ingest.example.com',
+        product: 'billing',
+        hmacKey: 'k',
+        fetch: fakeFetch as unknown as typeof fetch,
+        now: () => clock,
+        retries: 1,
+        retryBaseDelayMs: 0,
+        sleep: async () => {
+          clock += 5_000; // time genuinely passes during the backoff wait
+        },
+      });
+      await t.send('/ingest/health', {});
+      expect(seenTimestamps).toHaveLength(2);
+      expect(seenTimestamps[0]).not.toBe(seenTimestamps[1]);
+    });
+
+    it('does not retry a 400 (deterministically-malformed payload — a retry can never fix it)', async () => {
+      const fakeFetch = vi.fn(async () => ({ ok: false, status: 400 }) as Response);
+      const t = httpTransport({
+        baseUrl: 'https://ingest.example.com',
+        product: 'billing',
+        hmacKey: 'k',
+        fetch: fakeFetch as unknown as typeof fetch,
+        retries: 3,
+        retryBaseDelayMs: 0,
+        sleep: async () => {},
+      });
+      await expect(t.send('/ingest/health', {})).rejects.toThrow(/400/);
+      expect(fakeFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('retries a network-level failure (fetch throwing) the same as a non-ok response', async () => {
+      let calls = 0;
+      const fakeFetch = vi.fn(async () => {
+        calls++;
+        if (calls < 2) throw new Error('ECONNRESET');
+        return { ok: true, status: 200 } as Response;
+      });
+      const t = httpTransport({
+        baseUrl: 'https://ingest.example.com',
+        product: 'billing',
+        hmacKey: 'k',
+        fetch: fakeFetch as unknown as typeof fetch,
+        retries: 2,
+        retryBaseDelayMs: 0,
+        sleep: async () => {},
+      });
+      await expect(t.send('/ingest/health', {})).resolves.toBeUndefined();
+      expect(calls).toBe(2);
     });
   });
 });
