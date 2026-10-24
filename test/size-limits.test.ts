@@ -426,3 +426,27 @@ describe('review round 2', () => {
     } finally { vi.useRealTimers(); }
   });
 });
+
+describe('review round 3', () => {
+  const base = { product: 'billing', module: 'payments', version: 'v' };
+  it('identical bad input re-sent via forceResend does not re-count', async () => {
+    const tx: Transport = { async send() {} };
+    const t = createTelemetry({ ...base, transport: tx, autoStart: false, forceResendMs: 1 });
+    const input = { status: 'ok' as const, checks: [{ id: 'bad', status: 'x' as any }] };
+    await t.reportHealth(input);
+    await new Promise((r) => setTimeout(r, 5));
+    await t.reportHealth({ ...input });
+    expect(t.counters.health_sent).toBe(2);
+    expect(t.counters.health_trimmed).toBe(1);
+  });
+  it('a throwing keepAlive in the heartbeat does not escape the timer', async () => {
+    const tx: Transport = { async send() {} };
+    vi.useFakeTimers();
+    try {
+      const t = createTelemetry({ ...base, transport: tx, heartbeatMs: 1000, forceResendMs: 0, keepAlive: () => { throw new Error('boom'); } });
+      try { await t.reportHealth({ status: 'ok' }); } catch { /* the direct path may throw to caller; heartbeat must not */ }
+      await expect(vi.advanceTimersByTimeAsync(2500)).resolves.not.toThrow();
+      t.stop();
+    } finally { vi.useRealTimers(); }
+  });
+});

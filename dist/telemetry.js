@@ -32,6 +32,8 @@ export function createTelemetry(config) {
     let defaultTtl = Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
     if (!Number.isInteger(defaultTtl))
         defaultTtl = 90;
+    if (defaultTtl > LIMITS.ttlSeconds)
+        defaultTtl = LIMITS.ttlSeconds; // derived, not caller-supplied: clamp silently
     let ttlSeconds = config.ttlSeconds ?? defaultTtl;
     if (typeof ttlSeconds !== 'number' || !Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
         ttlSeconds = defaultTtl;
@@ -176,7 +178,7 @@ export function createTelemetry(config) {
         let checks = shape(detailCap);
         // The server also caps the request body (32 KiB on hx-health-ingest): shrink detail
         // budgets until the checks fit, so truncation actually guarantees delivery.
-        while (detailCap > 64 && byteLen(JSON.stringify(checks)) > LIMITS.healthBodyBytes - 2048) {
+        while (detailCap > 64 && byteLen(JSON.stringify(checks)) > LIMITS.healthBodyBytes - 2560) {
             detailCap = Math.floor(detailCap / 2);
             checks = shape(detailCap);
         }
@@ -277,7 +279,9 @@ export function createTelemetry(config) {
     async function doReportHealth(input) {
         try {
             lastInput = input;
-            const { report, stats } = buildHealth(input, true);
+            const sig = sigOf(input);
+            const fresh = sig !== lastCountedSig; // identical re-sends of an already-counted input never re-count
+            const { report, stats } = buildHealth(input, fresh);
             if (!report)
                 return;
             // Emit immediately on a status change (debounced vs the last sent status).
@@ -291,8 +295,10 @@ export function createTelemetry(config) {
             const forceDue = forceResendMs > 0 && elapsedSinceSend >= forceResendMs;
             if (statusChanged || forceDue) {
                 pendingStats = null;
-                lastCountedSig = sigOf(input);
-                noteBuildStats(stats);
+                if (fresh) {
+                    lastCountedSig = sig;
+                    noteBuildStats(stats);
+                }
                 await sendHealth(report);
                 lastSentChecksKey = checksKey(input.checks);
                 return;
@@ -300,7 +306,7 @@ export function createTelemetry(config) {
             // Suppressed. Make it VISIBLE — this branch used to return in total silence, which is how
             // InTake lost a report on 2026-08-17: no error, no return value, and `telemetry.dropped`
             // still 0, so by the platform's own metric nothing had happened.
-            pendingStats = sigOf(input) === lastCountedSig ? null : stats;
+            pendingStats = fresh ? stats : null;
             counters.health_suppressed += 1;
             const key = checksKey(input.checks);
             if (onWarn && lastSentChecksKey !== null && key !== lastSentChecksKey) {
@@ -462,8 +468,14 @@ export function createTelemetry(config) {
                 catch {
                     bumpDropped('health');
                 }
-                if (built)
-                    keepAlive(sendHealth(built));
+                if (built) {
+                    try {
+                        keepAlive(sendHealth(built));
+                    }
+                    catch {
+                        /* a throwing keepAlive must never crash the host from a timer */
+                    }
+                }
             }, heartbeatMs);
             heartbeatTimer.unref?.();
         }
