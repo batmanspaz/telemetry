@@ -217,7 +217,7 @@ imports `AnalyticsBatchSchema`): servers must stay on the old pin during the LIM
 
 Also: caller-supplied `ttl_seconds` > 30 d and `version`/`instance` > 256 chars are CLAMPED (report still sent) and
 counted in `counters.health_clamped`. Re-sending the same invalid/trimmed check re-counts it on each fresh
-`reportHealth()` call (heartbeats of the same input do not re-count).
+`reportHealth()` call that is sent (heartbeats of the same input do not re-count).
 
 ### 0.7.1 follow-ups (tasks.db #2492)
 
@@ -230,3 +230,6 @@ counted in `counters.health_clamped`. Re-sending the same invalid/trimmed check 
   there is room under the 50-check cap, never evicting user checks) and through `onWarn`.
 - `config.version` / `config.instance` / `config.ttlSeconds` are sanitised once in `createTelemetry` (counted once
   in `health_clamped`, `onWarn` once) instead of per call.
+- Trims/clamps of a debounce-suppressed call are counted when that input is next actually sent (heartbeat or report).
+- `telemetry.clamped` is cumulative (stays `warn` once anything was clamped/trimmed) and is omitted when a report already
+  carries 49 user checks (room for only `telemetry.dropped`); `onWarn` still fires.

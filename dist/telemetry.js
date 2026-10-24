@@ -29,7 +29,9 @@ export function createTelemetry(config) {
         }
         return v;
     };
-    const defaultTtl = Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
+    let defaultTtl = Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
+    if (!Number.isInteger(defaultTtl))
+        defaultTtl = 90;
     let ttlSeconds = config.ttlSeconds ?? defaultTtl;
     if (typeof ttlSeconds !== 'number' || !Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
         ttlSeconds = defaultTtl;
@@ -132,6 +134,8 @@ export function createTelemetry(config) {
     function byteLen(str) {
         return new TextEncoder().encode(str).length;
     }
+    /** Stats of a suppressed fresh call whose input was never sent; counted by the next send (heartbeat or report). */
+    let pendingStats = null;
     /** Pure builder: never touches counters. The caller counts `stats` only if the report is
      *  actually SENT (a debounce-suppressed call must not inflate them). */
     function buildHealth(input, pending = false) {
@@ -276,6 +280,7 @@ export function createTelemetry(config) {
             const elapsedSinceSend = lastSentAtMs === null ? Infinity : now() - lastSentAtMs;
             const forceDue = forceResendMs > 0 && elapsedSinceSend >= forceResendMs;
             if (statusChanged || forceDue) {
+                pendingStats = null;
                 noteBuildStats(stats);
                 await sendHealth(report);
                 lastSentChecksKey = checksKey(input.checks);
@@ -284,6 +289,7 @@ export function createTelemetry(config) {
             // Suppressed. Make it VISIBLE — this branch used to return in total silence, which is how
             // InTake lost a report on 2026-08-17: no error, no return value, and `telemetry.dropped`
             // still 0, so by the platform's own metric nothing had happened.
+            pendingStats = stats;
             counters.health_suppressed += 1;
             const key = checksKey(input.checks);
             if (onWarn && lastSentChecksKey !== null && key !== lastSentChecksKey) {
@@ -426,9 +432,20 @@ export function createTelemetry(config) {
             heartbeatTimer = setInterval(() => {
                 if (!lastInput)
                     return;
-                const { report } = buildHealth(lastInput);
-                if (report)
-                    keepAlive(sendHealth(report));
+                try {
+                    const owed = pendingStats;
+                    const { report } = buildHealth(lastInput, owed !== null);
+                    if (report) {
+                        if (owed) {
+                            pendingStats = null;
+                            noteBuildStats(owed);
+                        }
+                        keepAlive(sendHealth(report));
+                    }
+                }
+                catch {
+                    bumpDropped('health');
+                }
             }, heartbeatMs);
             heartbeatTimer.unref?.();
         }

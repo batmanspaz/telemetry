@@ -375,3 +375,24 @@ describe('0.7.1 follow-ups (tasks.db #2492)', () => {
     expect(t.counters.health_clamped).toBe(3); // not re-counted per call
   });
 });
+
+describe('suppressed call then heartbeat (review finding)', () => {
+  it('counts trims/clamps once when the suppressed input is finally sent by a heartbeat', async () => {
+    const sent: any[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    vi.useFakeTimers();
+    try {
+      const t = createTelemetry({ product: 'billing', module: 'payments', version: 'v', transport: tx, heartbeatMs: 1000, forceResendMs: 10_000_000 });
+      await t.reportHealth({ status: 'ok' });
+      await t.reportHealth({ status: 'ok', ttl_seconds: -1, checks: [{ id: 'bad', status: 'x' as any }] }); // suppressed
+      expect(t.counters.health_suppressed).toBe(1);
+      expect(t.counters.health_clamped).toBe(0);
+      await vi.advanceTimersByTimeAsync(3500);
+      t.stop();
+      expect(sent.length).toBeGreaterThan(1);
+      expect(t.counters.health_clamped).toBe(1);
+      expect(t.counters.health_trimmed).toBe(1);
+      expect(t.counters.dropped).toBe(1);
+    } finally { vi.useRealTimers(); }
+  });
+});
