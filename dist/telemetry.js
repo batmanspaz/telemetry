@@ -1,4 +1,4 @@
-import { HealthReportSchema, AnalyticsEventSchema, SCHEMA_VERSION, } from './schema.js';
+import { HealthReportSchema, HealthCheckSchema, AnalyticsEventSchema, SCHEMA_VERSION, } from './schema.js';
 import { LIMITS, truncateDetail } from './limits.js';
 import { hash } from './hash.js';
 import { scanForPii } from './pii.js';
@@ -18,7 +18,33 @@ export function createTelemetry(config) {
     const batchSize = config.batchSize ?? 20;
     const batchIntervalMs = config.batchIntervalMs ?? 5_000;
     const maxBufferedEvents = config.maxBufferedEvents ?? 1_000;
-    const ttlSeconds = config.ttlSeconds ?? Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
+    // Caller-supplied config values are sanitised ONCE here (not per call): a bad value is clamped
+    // to the wire caps/default instead of making every report fail schema validation.
+    let configClamped = 0;
+    const clampIdent = (v) => {
+        if (typeof v === 'string' && v.length > LIMITS.identifier) {
+            configClamped++;
+            const c = v.charCodeAt(LIMITS.identifier - 1);
+            return v.slice(0, c >= 0xd800 && c <= 0xdbff ? LIMITS.identifier - 1 : LIMITS.identifier);
+        }
+        return v;
+    };
+    let defaultTtl = Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
+    if (!Number.isInteger(defaultTtl))
+        defaultTtl = 90;
+    if (defaultTtl > LIMITS.ttlSeconds)
+        defaultTtl = LIMITS.ttlSeconds; // derived, not caller-supplied: clamp silently
+    let ttlSeconds = config.ttlSeconds ?? defaultTtl;
+    if (typeof ttlSeconds !== 'number' || !Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
+        ttlSeconds = defaultTtl;
+        configClamped++;
+    }
+    else if (ttlSeconds > LIMITS.ttlSeconds) {
+        ttlSeconds = LIMITS.ttlSeconds;
+        configClamped++;
+    }
+    const cfgVersion = clampIdent(config.version);
+    const cfgInstance = clampIdent(config.instance);
     const forceResendMs = config.forceResendMs ?? Math.floor((ttlSeconds * 1000) / 2);
     const autoStart = config.autoStart ?? true;
     const keepAlive = config.keepAlive ?? (() => { });
@@ -30,7 +56,8 @@ export function createTelemetry(config) {
         events_dropped: 0,
         events_deduped: 0,
         health_suppressed: 0,
-        health_clamped: 0,
+        health_clamped: configClamped,
+        health_trimmed: 0,
         dropped: 0,
     };
     let lastInput = null;
@@ -41,6 +68,14 @@ export function createTelemetry(config) {
      *  suppressed. */
     let lastSentChecksKey = null;
     const onWarn = config.onWarn;
+    if (configClamped > 0 && onWarn) {
+        try {
+            onWarn(`[telemetry] ${config.product}/${config.module}: clamped ${configClamped} config value(s) (version/instance/ttlSeconds) to the wire caps.`);
+        }
+        catch {
+            /* hook failure must never break the client */
+        }
+    }
     const onTransportError = config.onTransportError;
     /** Invokes onTransportError defensively — a hook that itself throws (or, if async, rejects)
      *  must never propagate out of the client's own try/catch and break the "never throws"
@@ -76,7 +111,7 @@ export function createTelemetry(config) {
             /* the hook's own synchronous failure is not this client's problem to propagate */
         }
     }
-    const checksKey = (checks) => JSON.stringify((checks ?? []).map((c) => [c.id, c.status]).sort());
+    const checksKey = (checks) => JSON.stringify((Array.isArray(checks) ? checks : []).map((c) => [c?.id, c?.status]).sort());
     // Buffer holds fully-validated AnalyticsEvent objects (each already carries its
     // own dedupe_key) — the wire body is this array, verbatim, with no envelope.
     const buffer = [];
@@ -101,58 +136,97 @@ export function createTelemetry(config) {
     function byteLen(str) {
         return new TextEncoder().encode(str).length;
     }
-    function buildHealth(input, countDrops = false) {
-        // Over-long detail is truncated (with a marker), never grounds to drop the whole report.
-        // One slot is reserved for the auto `telemetry.dropped` check below; checks beyond
-        // the cap are trimmed (and counted) rather than dropping the whole report.
-        // A single invalid check (id empty/>256, unit >32) is dropped on its own, never the
-        // whole report. Drops are counted only when countDrops (a fresh reportHealth call):
-        // heartbeats rebuild from lastInput and must not re-count the same trimmed checks.
-        let userChecks = (input.checks ?? []).filter((c) => typeof c.id === 'string' && c.id.length >= 1 && c.id.length <= LIMITS.checkId &&
-            (c.unit === undefined || (typeof c.unit === 'string' && c.unit.length <= LIMITS.checkUnit)));
-        let trimmed = (input.checks?.length ?? 0) - userChecks.length;
-        if (userChecks.length > LIMITS.checks - 1) {
-            trimmed += userChecks.length - (LIMITS.checks - 1);
-            userChecks = userChecks.slice(0, LIMITS.checks - 1);
+    /** Stats of a suppressed fresh call whose input was never sent; counted by the next send (heartbeat or report). */
+    let pendingStats = null;
+    /** Signature of the last input whose trims/clamps were counted; an identical later call must not re-count. */
+    let lastCountedSig = null;
+    const sigOf = (i) => {
+        try {
+            return JSON.stringify([i.checks, i.ttl_seconds, i.version, i.instance]);
         }
-        if (countDrops && trimmed > 0)
-            counters.dropped += trimmed;
+        catch {
+            return `unserialisable:${Math.random()}`;
+        }
+    };
+    /** Pure builder: never touches counters. The caller counts `stats` only if the report is
+     *  actually SENT (a debounce-suppressed call must not inflate them). */
+    function buildHealth(input, pending = false) {
+        const stats = { trimmed: 0, clamped: 0 };
+        const rawChecks = Array.isArray(input.checks) ? input.checks : [];
+        // Truncate over-long detail first (never grounds to drop), then validate EACH check against
+        // the wire schema: one invalid check (bad status/unit/id, non-string detail, extra key) is
+        // dropped on its own, never the whole report.
+        const truncAt = (c, cap) => c && typeof c === 'object' && typeof c.detail === 'string' && c.detail.length > cap
+            ? { ...c, detail: truncateDetail(c.detail, cap) }
+            : c;
+        let valid = [];
+        for (const c of rawChecks) {
+            const r = HealthCheckSchema.safeParse(truncAt(c, LIMITS.checkDetail));
+            if (r.success)
+                valid.push(r.data);
+            else
+                stats.trimmed++;
+        }
+        // One slot is reserved for the auto `telemetry.dropped` check below; checks beyond the cap
+        // are trimmed (and counted) rather than dropping the whole report.
+        if (valid.length > LIMITS.checks - 1) {
+            stats.trimmed += valid.length - (LIMITS.checks - 1);
+            valid = valid.slice(0, LIMITS.checks - 1);
+        }
         let detailCap = LIMITS.checkDetail;
-        const shape = (cap) => userChecks.map((c) => typeof c.detail === 'string' && c.detail.length > cap ? { ...c, detail: truncateDetail(c.detail, cap) } : c);
+        const shape = (cap) => valid.map((c) => truncAt(c, cap));
         let checks = shape(detailCap);
         // The server also caps the request body (32 KiB on hx-health-ingest): shrink detail
         // budgets until the checks fit, so truncation actually guarantees delivery.
-        while (detailCap > 64 && byteLen(JSON.stringify(checks)) > LIMITS.healthBodyBytes - 2048) {
+        while (detailCap > 64 && byteLen(JSON.stringify(checks)) > LIMITS.healthBodyBytes - 2560) {
             detailCap = Math.floor(detailCap / 2);
             checks = shape(detailCap);
         }
-        // Self-report the dropped-emission counter so the observability layer can't
-        // fail silently — a non-zero drop count shows up as a warn check.
-        checks.push({
-            id: 'telemetry.dropped',
-            status: counters.dropped > 0 ? 'warn' : 'pass',
-            metric: counters.dropped,
-            unit: 'count',
-        });
-        // Clamp (never drop the report) caller-supplied values that exceed the wire caps.
-        let clamped = 0;
+        // Clamp (never drop the report) caller-supplied per-call values that violate the wire caps.
         const clampStr = (v) => {
             if (typeof v === 'string' && v.length > LIMITS.identifier) {
-                clamped++;
+                stats.clamped++;
                 const c = v.charCodeAt(LIMITS.identifier - 1);
                 return v.slice(0, c >= 0xd800 && c <= 0xdbff ? LIMITS.identifier - 1 : LIMITS.identifier);
             }
             return v;
         };
         let ttl = input.ttl_seconds ?? ttlSeconds;
-        if (ttl > LIMITS.ttlSeconds) {
-            ttl = LIMITS.ttlSeconds;
-            clamped++;
+        if (typeof ttl !== 'number' || !Number.isInteger(ttl) || ttl <= 0) {
+            ttl = ttlSeconds; // NaN / Infinity / float / <=0 -> the (already sanitised) default
+            stats.clamped++;
         }
-        const clInstance = clampStr(input.instance ?? config.instance);
-        const clVersion = clampStr(input.version ?? config.version);
-        if (countDrops && clamped > 0)
-            counters.health_clamped += clamped;
+        else if (ttl > LIMITS.ttlSeconds) {
+            ttl = LIMITS.ttlSeconds;
+            stats.clamped++;
+        }
+        const clInstance = input.instance != null ? clampStr(input.instance) : cfgInstance;
+        const clVersion = input.version != null ? clampStr(input.version) : cfgVersion;
+        // Self-report the dropped-emission counter so the observability layer can't
+        // fail silently — a non-zero drop count shows up as a warn check.
+        // `pending` = this build is a fresh reportHealth that will be counted if sent; heartbeat
+        // rebuilds (pending=false) were already counted, so their stats must not be added again.
+        const addT = pending ? stats.trimmed : 0;
+        const addC = pending ? stats.clamped : 0;
+        checks.push({
+            id: 'telemetry.dropped',
+            status: counters.dropped + addT > 0 ? 'warn' : 'pass',
+            metric: counters.dropped + addT,
+            unit: 'count',
+        });
+        // Self-report clamps/trims so the health platform sees them (not only a local counter).
+        // Appended only when there is room: user checks are never evicted for it.
+        const clampedTotal = counters.health_clamped + addC;
+        const trimmedTotal = counters.health_trimmed + addT;
+        if ((clampedTotal > 0 || trimmedTotal > 0) && checks.length < LIMITS.checks) {
+            checks.push({
+                id: 'telemetry.clamped',
+                status: 'warn',
+                metric: clampedTotal,
+                unit: 'count',
+                detail: `clamped ${clampedTotal} caller value(s) to wire caps; trimmed ${trimmedTotal} check(s)`,
+            });
+        }
         const candidate = {
             schema_version: SCHEMA_VERSION,
             product: config.product,
@@ -168,9 +242,27 @@ export function createTelemetry(config) {
         const parsed = HealthReportSchema.safeParse(candidate);
         if (!parsed.success) {
             bumpDropped('health');
-            return null;
+            return { report: null, stats };
         }
-        return parsed.data;
+        return { report: parsed.data, stats };
+    }
+    /** Count + warn about a fresh report's clamps/trims; called only on the SEND path. */
+    function noteBuildStats(stats) {
+        if (stats.trimmed > 0) {
+            counters.dropped += stats.trimmed;
+            counters.health_trimmed += stats.trimmed;
+        }
+        if (stats.clamped > 0)
+            counters.health_clamped += stats.clamped;
+        if ((stats.trimmed > 0 || stats.clamped > 0) && onWarn) {
+            try {
+                onWarn(`[telemetry] health report for ${config.product}/${config.module}: clamped ${stats.clamped} ` +
+                    `caller value(s) and trimmed ${stats.trimmed} check(s) to fit the wire caps.`);
+            }
+            catch {
+                /* hook failure must never break the client */
+            }
+        }
     }
     async function sendHealth(report) {
         try {
@@ -187,7 +279,9 @@ export function createTelemetry(config) {
     async function doReportHealth(input) {
         try {
             lastInput = input;
-            const report = buildHealth(input, true);
+            const sig = sigOf(input);
+            const fresh = sig !== lastCountedSig; // identical re-sends of an already-counted input never re-count
+            const { report, stats } = buildHealth(input, fresh);
             if (!report)
                 return;
             // Emit immediately on a status change (debounced vs the last sent status).
@@ -200,6 +294,11 @@ export function createTelemetry(config) {
             const elapsedSinceSend = lastSentAtMs === null ? Infinity : now() - lastSentAtMs;
             const forceDue = forceResendMs > 0 && elapsedSinceSend >= forceResendMs;
             if (statusChanged || forceDue) {
+                pendingStats = null;
+                if (fresh) {
+                    lastCountedSig = sig;
+                    noteBuildStats(stats);
+                }
                 await sendHealth(report);
                 lastSentChecksKey = checksKey(input.checks);
                 return;
@@ -207,16 +306,20 @@ export function createTelemetry(config) {
             // Suppressed. Make it VISIBLE — this branch used to return in total silence, which is how
             // InTake lost a report on 2026-08-17: no error, no return value, and `telemetry.dropped`
             // still 0, so by the platform's own metric nothing had happened.
+            pendingStats = fresh ? stats : null;
             counters.health_suppressed += 1;
             const key = checksKey(input.checks);
             if (onWarn && lastSentChecksKey !== null && key !== lastSentChecksKey) {
                 // Identical repeats are exactly what the debounce is for and are not worth a word.
                 // DIFFERING checks mean the caller believes it is reporting something new and is not —
                 // cheap to detect here, impossible to notice from the call site.
-                onWarn(`[telemetry] suppressed a health report whose checks DIFFER from the last one sent ` +
-                    `(${config.product}/${config.module}, status unchanged: ${report.status}). The debounce ` +
-                    `only re-sends on a status change or after forceResendMs, so this payload was never ` +
-                    `transmitted. If these checks belong to a distinct concern, give them their own module.`);
+                try {
+                    onWarn(`[telemetry] suppressed a health report whose checks DIFFER from the last one sent ` +
+                        `(${config.product}/${config.module}, status unchanged: ${report.status}). The debounce ` +
+                        `only re-sends on a status change or after forceResendMs, so this payload was never ` +
+                        `transmitted. If these checks belong to a distinct concern, give them their own module.`);
+                }
+                catch { /* hook failure must never break the client */ }
             }
         }
         catch {
@@ -349,9 +452,30 @@ export function createTelemetry(config) {
             heartbeatTimer = setInterval(() => {
                 if (!lastInput)
                     return;
-                const report = buildHealth(lastInput);
-                if (report)
-                    keepAlive(sendHealth(report));
+                let built = null;
+                try {
+                    const owed = pendingStats;
+                    const { report } = buildHealth(lastInput, owed !== null);
+                    if (report) {
+                        if (owed) {
+                            pendingStats = null;
+                            lastCountedSig = sigOf(lastInput);
+                            noteBuildStats(owed);
+                        }
+                        built = report;
+                    }
+                }
+                catch {
+                    bumpDropped('health');
+                }
+                if (built) {
+                    try {
+                        keepAlive(sendHealth(built));
+                    }
+                    catch {
+                        /* a throwing keepAlive must never crash the host from a timer */
+                    }
+                }
             }, heartbeatMs);
             heartbeatTimer.unref?.();
         }

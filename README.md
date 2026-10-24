@@ -217,4 +217,20 @@ imports `AnalyticsBatchSchema`): servers must stay on the old pin during the LIM
 
 Also: caller-supplied `ttl_seconds` > 30 d and `version`/`instance` > 256 chars are CLAMPED (report still sent) and
 counted in `counters.health_clamped`. Re-sending the same invalid/trimmed check re-counts it on each fresh
-`reportHealth()` call (heartbeats of the same input do not re-count).
+`reportHealth()` call that is sent (heartbeats of the same input do not re-count).
+
+### 0.7.1 follow-ups (tasks.db #2492)
+
+- Trimmed/clamped counts are recorded on the SEND path only (debounce-suppressed `reportHealth` calls no longer inflate
+  `dropped` / `health_clamped`); new `counters.health_trimmed`.
+- Every check is validated with `HealthCheckSchema` after truncation; only the invalid check is dropped (bad status,
+  non-string detail, extra key, null), never the report.
+- `ttl_seconds` that is <= 0, non-integer, NaN or Infinity is clamped to the default (> 30 d still clamps to the cap).
+- Clamps/trims are self-reported as a `telemetry.clamped` check (warn, metric = clamped count; only appended when
+  there is room under the 50-check cap, never evicting user checks) and through `onWarn`.
+- `config.version` / `config.instance` / `config.ttlSeconds` are sanitised once in `createTelemetry` (counted once
+  in `health_clamped`, `onWarn` once) instead of per call.
+- Trims/clamps of a debounce-suppressed call are counted when that (differing) input is next actually sent; identical repeats never re-count (heartbeat or report).
+- `telemetry.clamped` is cumulative (stays `warn` once anything was clamped/trimmed) and is omitted when a report already
+  carries 49 user checks (room for only `telemetry.dropped`); `onWarn` still fires.
+- Release note: `telemetry.clamped` is a NEW check id that appears (warn) on reports once anything was clamped/trimmed, including a one-time over-long `config.version`; dashboards alerting on any warn check will see it.

@@ -123,6 +123,9 @@ export interface Counters {
     health_suppressed: number;
     /** Caller-supplied ttl_seconds/version/instance clamped to the wire caps (report still sent). */
     health_clamped: number;
+    /** Health checks dropped individually (schema-invalid) or trimmed over the checks cap, counted on the
+     *  SEND path only (also included in `dropped`). */
+    health_trimmed: number;
     /** telemetry.dropped rollup (health + events) surfaced as a health check. */
     dropped: number;
 }

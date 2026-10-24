@@ -262,7 +262,7 @@ describe('delta-review fixes', () => {
       { id: 'badunit', status: 'pass', unit: 'u'.repeat(33) },
     ] });
     expect(sent.length).toBe(1);
-    expect(sent[0].checks.map((c: any) => c.id)).toEqual(['ok1', 'telemetry.dropped']);
+    expect(sent[0].checks.map((c: any) => c.id)).toEqual(['ok1', 'telemetry.dropped', 'telemetry.clamped']);
     expect(t.counters.dropped).toBe(2);
     expect(t.counters.health_dropped).toBe(0);
   });
@@ -287,5 +287,166 @@ describe('clamp instead of dropping the whole report', () => {
     expect(sent[0].instance.length).toBe(256);
     expect(t.counters.health_dropped).toBe(0);
     expect(t.counters.health_clamped).toBe(3);
+  });
+});
+
+describe('0.7.1 follow-ups (tasks.db #2492)', () => {
+  const cfg = { product: 'billing', module: 'payments', version: 'v', autoStart: false as const };
+  const mk = (over: Record<string, unknown> = {}) => {
+    const sent: any[] = [];
+    const warns: string[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    const t = createTelemetry({ ...cfg, transport: tx, onWarn: (m) => warns.push(m), ...over });
+    return { t, sent, warns };
+  };
+  const many = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `c${i}`, status: 'pass' as const }));
+
+  it('(1) trimmed/clamped are NOT counted by suppressed reportHealth calls', async () => {
+    const { t, sent } = mk();
+    await t.reportHealth({ status: 'ok', checks: many(52) });
+    expect(t.counters.dropped).toBe(3);
+    await t.reportHealth({ status: 'ok', checks: many(52), version: 'v'.repeat(300) }); // suppressed (same status)
+    await t.reportHealth({ status: 'ok', checks: many(52), version: 'v'.repeat(300) }); // suppressed
+    expect(sent.length).toBe(1);
+    expect(t.counters.health_suppressed).toBe(2);
+    expect(t.counters.dropped).toBe(3);
+    expect(t.counters.health_clamped).toBe(0);
+  });
+
+  it('(2) one schema-invalid check (bad status / non-string detail / extra key) is dropped alone', async () => {
+    const { t, sent } = mk();
+    await t.reportHealth({ status: 'ok', checks: [
+      { id: 'good', status: 'pass' },
+      { id: 'badstatus', status: 'bogus' as any },
+      { id: 'baddetail', status: 'pass', detail: 123 as any },
+      { id: 'extra', status: 'pass', foo: 1 } as any,
+      null as any,
+    ] });
+    expect(sent.length).toBe(1);
+    expect(sent[0].checks.map((c: any) => c.id)).toEqual(['good', 'telemetry.dropped', 'telemetry.clamped']);
+    expect(t.counters.health_dropped).toBe(0);
+    expect(t.counters.dropped).toBe(4);
+  });
+
+  it('(3) ttl_seconds <=0 / float / NaN / Infinity clamps to the default, report still sent', async () => {
+    for (const bad of [0, -5, 1.5, NaN, Infinity]) {
+      const { t, sent } = mk({ ttlSeconds: 120 });
+      await t.reportHealth({ status: 'ok', ttl_seconds: bad });
+      expect(sent.length).toBe(1);
+      expect(sent[0].ttl_seconds).toBe(120);
+      expect(t.counters.health_dropped).toBe(0);
+      expect(t.counters.health_clamped).toBe(1);
+    }
+  });
+
+  it('(4) clamps/trims are self-reported as a telemetry.clamped check and via onWarn', async () => {
+    const { t, sent, warns } = mk();
+    await t.reportHealth({ status: 'ok', ttl_seconds: -1, checks: [{ id: 'a', status: 'pass' }, { id: 'b', status: 'x' as any }] });
+    const c = sent[0].checks.find((x: any) => x.id === 'telemetry.clamped');
+    expect(c).toBeTruthy();
+    expect(c.status).toBe('warn');
+    expect(c.metric).toBe(1);
+    expect(c.detail).toMatch(/trimmed 1/);
+    expect(warns.some((w) => /clamped|trimmed/.test(w))).toBe(true);
+    expect(t.counters.health_trimmed).toBe(1);
+    // clean report: no telemetry.clamped noise once nothing new... (cumulative stays visible)
+    const clean = mk();
+    await clean.t.reportHealth({ status: 'ok' });
+    expect(clean.sent[0].checks.map((x: any) => x.id)).toEqual(['telemetry.dropped']);
+  });
+
+  it('(4b) never evicts user checks to make room for telemetry.clamped; stays within the cap', async () => {
+    const { t, sent } = mk();
+    await t.reportHealth({ status: 'ok', ttl_seconds: -1, checks: many(49) });
+    expect(sent[0].checks.length).toBeLessThanOrEqual(50);
+    expect(HealthReportSchema.safeParse(sent[0]).success).toBe(true);
+  });
+
+  it('(5) config.version / config.instance / config.ttlSeconds are clamped once at creation', async () => {
+    const { t, sent, warns } = mk({ version: 'v'.repeat(300), instance: 'i'.repeat(300), ttlSeconds: -3 });
+    expect(t.counters.health_clamped).toBe(3);
+    expect(warns.length).toBeGreaterThan(0);
+    await t.reportHealth({ status: 'ok' });
+    await t.reportHealth({ status: 'degraded' });
+    expect(sent.length).toBe(2);
+    expect(sent[0].version.length).toBe(256);
+    expect(sent[0].instance.length).toBe(256);
+    expect(sent[0].ttl_seconds).toBeGreaterThan(0);
+    expect(t.counters.health_clamped).toBe(3); // not re-counted per call
+  });
+});
+
+describe('suppressed call then heartbeat (review finding)', () => {
+  it('counts trims/clamps once when the suppressed input is finally sent by a heartbeat', async () => {
+    const sent: any[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    vi.useFakeTimers();
+    try {
+      const t = createTelemetry({ product: 'billing', module: 'payments', version: 'v', transport: tx, heartbeatMs: 1000, forceResendMs: 10_000_000 });
+      await t.reportHealth({ status: 'ok' });
+      await t.reportHealth({ status: 'ok', ttl_seconds: -1, checks: [{ id: 'bad', status: 'x' as any }] }); // suppressed
+      expect(t.counters.health_suppressed).toBe(1);
+      expect(t.counters.health_clamped).toBe(0);
+      await vi.advanceTimersByTimeAsync(3500);
+      t.stop();
+      expect(sent.length).toBeGreaterThan(1);
+      expect(t.counters.health_clamped).toBe(1);
+      expect(t.counters.health_trimmed).toBe(1);
+      expect(t.counters.dropped).toBe(1);
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('review round 2', () => {
+  const base = { product: 'billing', module: 'payments', version: 'v' };
+  it('null version/instance on a call falls back to config instead of dropping the report', async () => {
+    const sent: any[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    const t = createTelemetry({ ...base, transport: tx, autoStart: false });
+    await t.reportHealth({ status: 'ok', version: null as any, instance: null as any });
+    expect(sent.length).toBe(1);
+    expect(sent[0].version).toBe('v');
+    expect(t.counters.health_dropped).toBe(0);
+  });
+  it('identical repeated suppressed calls across heartbeats count once', async () => {
+    const sent: any[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    vi.useFakeTimers();
+    try {
+      const t = createTelemetry({ ...base, transport: tx, heartbeatMs: 1000, forceResendMs: 0 });
+      const input = { status: 'ok' as const, checks: [{ id: 'bad', status: 'x' as any }] };
+      await t.reportHealth(input);
+      for (let i = 0; i < 5; i++) {
+        await t.reportHealth({ ...input });
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+      t.stop();
+      expect(t.counters.health_trimmed).toBe(1);
+      expect(t.counters.dropped).toBe(1);
+    } finally { vi.useRealTimers(); }
+  });
+});
+
+describe('review round 3', () => {
+  const base = { product: 'billing', module: 'payments', version: 'v' };
+  it('identical bad input re-sent via forceResend does not re-count', async () => {
+    const tx: Transport = { async send() {} };
+    const t = createTelemetry({ ...base, transport: tx, autoStart: false, forceResendMs: 1 });
+    const input = { status: 'ok' as const, checks: [{ id: 'bad', status: 'x' as any }] };
+    await t.reportHealth(input);
+    await new Promise((r) => setTimeout(r, 5));
+    await t.reportHealth({ ...input });
+    expect(t.counters.health_sent).toBe(2);
+    expect(t.counters.health_trimmed).toBe(1);
+  });
+  it('a throwing keepAlive in the heartbeat does not escape the timer', async () => {
+    const tx: Transport = { async send() {} };
+    vi.useFakeTimers();
+    try {
+      const t = createTelemetry({ ...base, transport: tx, heartbeatMs: 1000, forceResendMs: 0, keepAlive: () => { throw new Error('boom'); } });
+      try { await t.reportHealth({ status: 'ok' }); } catch { /* the direct path may throw to caller; heartbeat must not */ }
+      await expect(vi.advanceTimersByTimeAsync(2500)).resolves.not.toThrow();
+      t.stop();
+    } finally { vi.useRealTimers(); }
   });
 });
