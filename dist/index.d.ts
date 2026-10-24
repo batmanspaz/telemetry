@@ -1,4 +1,5 @@
 export { SCHEMA_VERSION, HealthStatusSchema, CheckStatusSchema, HealthCheckSchema, HealthReportSchema, AnalyticsEventSchema, AnalyticsBatchSchema, type HealthStatus, type CheckStatus, type HealthCheck, type HealthReport, type AnalyticsEvent, type AnalyticsBatch, type PropValue, } from './schema.js';
+export { LIMITS, TRUNCATION_MARKER, truncateDetail, parseLimitsMode, type LimitsMode } from './limits.js';
 export { hash } from './hash.js';
 export { isStale } from './stale.js';
 export { looksLikePii, scanForPii } from './pii.js';

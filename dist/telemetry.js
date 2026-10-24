@@ -1,4 +1,5 @@
 import { HealthReportSchema, AnalyticsEventSchema, SCHEMA_VERSION, } from './schema.js';
+import { LIMITS, truncateDetail } from './limits.js';
 import { hash } from './hash.js';
 import { scanForPii } from './pii.js';
 import { noopTransport } from './transport.js';
@@ -97,7 +98,12 @@ export function createTelemetry(config) {
         return new Date(now()).toISOString();
     }
     function buildHealth(input) {
-        const checks = input.checks ? [...input.checks] : [];
+        // Over-long detail is truncated (with a marker), never grounds to drop the whole report.
+        const checks = input.checks
+            ? input.checks.map((c) => typeof c.detail === 'string' && c.detail.length > LIMITS.checkDetail
+                ? { ...c, detail: truncateDetail(c.detail) }
+                : c)
+            : [];
         // Self-report the dropped-emission counter so the observability layer can't
         // fail silently — a non-zero drop count shows up as a warn check.
         checks.push({
@@ -241,21 +247,27 @@ export function createTelemetry(config) {
         if (buffer.length === 0)
             return;
         lastFlushAtMs = now();
-        const batch = buffer.splice(0, buffer.length);
-        try {
-            // The wire body is a bare array of events — matches the server's
-            // AnalyticsBatch schema exactly (no wrapping envelope).
-            await transport.send(ANALYTICS_PATH, batch);
-            counters.events_sent += batch.length;
-        }
-        catch (error) {
-            // Requeue (keys stay in seenKeys, so no re-buffering) and count the drop.
-            // Each event's own dedupe_key means the eventual successful send is
-            // idempotent downstream even after a retried batch.
-            buffer.unshift(...batch);
-            bumpDropped('event', batch.length);
-            trimBufferToCap();
-            reportTransportError({ kind: 'event', path: ANALYTICS_PATH, error, count: batch.length });
+        // Chunk to the server's batch cap: a request over LIMITS.batch is rejected whole
+        // (data loss), so a large maxBufferedEvents must never become one giant request.
+        while (buffer.length > 0) {
+            const batch = buffer.splice(0, Math.min(buffer.length, LIMITS.batch));
+            try {
+                // The wire body is a bare array of events — matches the server's
+                // AnalyticsBatch schema exactly (no wrapping envelope).
+                await transport.send(ANALYTICS_PATH, batch);
+                counters.events_sent += batch.length;
+            }
+            catch (error) {
+                // Requeue (keys stay in seenKeys, so no re-buffering) and count the drop.
+                // Each event's own dedupe_key means the eventual successful send is
+                // idempotent downstream even after a retried batch. Stop on failure; the
+                // remaining chunks stay buffered for the next flush.
+                buffer.unshift(...batch);
+                bumpDropped('event', batch.length);
+                trimBufferToCap();
+                reportTransportError({ kind: 'event', path: ANALYTICS_PATH, error, count: batch.length });
+                return;
+            }
         }
     }
     // Same keepAlive registration as reportHealth() above, for the same reason.

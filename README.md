@@ -198,3 +198,12 @@ pnpm test   # 78 tests green
 ```
 
 No secrets in code — the HMAC key is sourced from config/env at runtime.
+
+## Size limits (v0.7.0)
+
+Wire caps live in `src/limits.ts` (`LIMITS`): batch 1000 events, 50 checks, 128 prop keys (key 128 chars,
+string value 1024), check id 256 / unit 32 / detail 16384, identifiers 256, event name 128, ttl 30 days.
+The client truncates over-long check `detail` (marker `...[truncated]`) instead of dropping the report,
+and `flush()` chunks to the batch cap. Ingest Workers enforce the same numbers behind
+`LIMITS_MODE=shadow|enforce|off` (default `shadow`; see `parseLimitsMode`) and emit
+`ingest.limit_violation{field,platform,product}`.

@@ -4,6 +4,9 @@ import {
   AnalyticsEventSchema,
   AnalyticsBatchSchema,
   createTelemetry,
+  truncateDetail,
+  parseLimitsMode,
+  LIMITS,
   type Transport,
 } from '../src/index.js';
 
@@ -148,5 +151,40 @@ describe('client behaviour at the caps', () => {
     await t.flush();
     expect(sizes.reduce((a, b) => a + b, 0)).toBe(2500); // nothing lost
     expect(Math.max(...sizes)).toBeLessThanOrEqual(CAP.batch);
+  });
+});
+
+describe('client truncates oversize check detail (never drops the report)', () => {
+  it('sends the report with detail truncated to the cap and a marker', async () => {
+    const sent: any[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    const t = createTelemetry({ product: 'billing', module: 'payments', version: 'v', autoStart: false, transport: tx });
+    await t.reportHealth({ status: 'ok', checks: [{ id: 'a', status: 'pass', detail: 'x'.repeat(CAP.checkDetail * 2) }] });
+    expect(sent.length).toBe(1);
+    const d = sent[0].checks[0].detail as string;
+    expect(d.length).toBe(CAP.checkDetail);
+    expect(d.endsWith('[truncated]')).toBe(true);
+    expect(t.counters.health_dropped).toBe(0);
+  });
+  it('leaves in-cap detail untouched', () => {
+    expect(truncateDetail('abc')).toBe('abc');
+    const exact = 'y'.repeat(CAP.checkDetail);
+    expect(truncateDetail(exact)).toBe(exact);
+  });
+});
+
+describe('parseLimitsMode', () => {
+  it('defaults to shadow; honours enforce/off/shadow', () => {
+    expect(parseLimitsMode(undefined)).toBe('shadow');
+    expect(parseLimitsMode('garbage')).toBe('shadow');
+    expect(parseLimitsMode('')).toBe('shadow');
+    expect(parseLimitsMode('enforce')).toBe('enforce');
+    expect(parseLimitsMode('off')).toBe('off');
+    expect(parseLimitsMode('shadow')).toBe('shadow');
+  });
+  it('exports LIMITS matching the contract', () => {
+    expect(LIMITS.batch).toBe(CAP.batch);
+    expect(LIMITS.ttlSeconds).toBe(CAP.ttl);
+    expect(LIMITS.analyticsBodyBytes).toBe(1_048_576);
   });
 });
