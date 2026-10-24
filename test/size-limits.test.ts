@@ -396,3 +396,33 @@ describe('suppressed call then heartbeat (review finding)', () => {
     } finally { vi.useRealTimers(); }
   });
 });
+
+describe('review round 2', () => {
+  const base = { product: 'billing', module: 'payments', version: 'v' };
+  it('null version/instance on a call falls back to config instead of dropping the report', async () => {
+    const sent: any[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    const t = createTelemetry({ ...base, transport: tx, autoStart: false });
+    await t.reportHealth({ status: 'ok', version: null as any, instance: null as any });
+    expect(sent.length).toBe(1);
+    expect(sent[0].version).toBe('v');
+    expect(t.counters.health_dropped).toBe(0);
+  });
+  it('identical repeated suppressed calls across heartbeats count once', async () => {
+    const sent: any[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    vi.useFakeTimers();
+    try {
+      const t = createTelemetry({ ...base, transport: tx, heartbeatMs: 1000, forceResendMs: 0 });
+      const input = { status: 'ok' as const, checks: [{ id: 'bad', status: 'x' as any }] };
+      await t.reportHealth(input);
+      for (let i = 0; i < 5; i++) {
+        await t.reportHealth({ ...input });
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+      t.stop();
+      expect(t.counters.health_trimmed).toBe(1);
+      expect(t.counters.dropped).toBe(1);
+    } finally { vi.useRealTimers(); }
+  });
+});

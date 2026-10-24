@@ -327,6 +327,15 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   interface BuildStats { trimmed: number; clamped: number }
   /** Stats of a suppressed fresh call whose input was never sent; counted by the next send (heartbeat or report). */
   let pendingStats: BuildStats | null = null;
+  /** Signature of the last input whose trims/clamps were counted; an identical later call must not re-count. */
+  let lastCountedSig: string | null = null;
+  const sigOf = (i: HealthInput): string => {
+    try {
+      return JSON.stringify([i.checks, i.ttl_seconds, i.version, i.instance]);
+    } catch {
+      return `unserialisable:${Math.random()}`;
+    }
+  };
 
   /** Pure builder: never touches counters. The caller counts `stats` only if the report is
    *  actually SENT (a debounce-suppressed call must not inflate them). */
@@ -379,8 +388,8 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       ttl = LIMITS.ttlSeconds;
       stats.clamped++;
     }
-    const clInstance = input.instance !== undefined ? clampStr(input.instance) : cfgInstance;
-    const clVersion = input.version !== undefined ? clampStr(input.version) : cfgVersion;
+    const clInstance = input.instance != null ? clampStr(input.instance) : cfgInstance;
+    const clVersion = input.version != null ? clampStr(input.version) : cfgVersion;
 
     // Self-report the dropped-emission counter so the observability layer can't
     // fail silently — a non-zero drop count shows up as a warn check.
@@ -476,6 +485,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       const forceDue = forceResendMs > 0 && elapsedSinceSend >= forceResendMs;
       if (statusChanged || forceDue) {
         pendingStats = null;
+        lastCountedSig = sigOf(input);
         noteBuildStats(stats);
         await sendHealth(report);
         lastSentChecksKey = checksKey(input.checks);
@@ -485,19 +495,19 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       // Suppressed. Make it VISIBLE — this branch used to return in total silence, which is how
       // InTake lost a report on 2026-08-17: no error, no return value, and `telemetry.dropped`
       // still 0, so by the platform's own metric nothing had happened.
-      pendingStats = stats;
+      pendingStats = sigOf(input) === lastCountedSig ? null : stats;
       counters.health_suppressed += 1;
       const key = checksKey(input.checks);
       if (onWarn && lastSentChecksKey !== null && key !== lastSentChecksKey) {
         // Identical repeats are exactly what the debounce is for and are not worth a word.
         // DIFFERING checks mean the caller believes it is reporting something new and is not —
         // cheap to detect here, impossible to notice from the call site.
-        onWarn(
+        try { onWarn(
           `[telemetry] suppressed a health report whose checks DIFFER from the last one sent ` +
             `(${config.product}/${config.module}, status unchanged: ${report.status}). The debounce ` +
             `only re-sends on a status change or after forceResendMs, so this payload was never ` +
             `transmitted. If these checks belong to a distinct concern, give them their own module.`,
-        );
+        ); } catch { /* hook failure must never break the client */ }
       }
     } catch {
       bumpDropped('health');
@@ -635,19 +645,22 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     if (heartbeatMs > 0 && !heartbeatTimer) {
       heartbeatTimer = setInterval(() => {
         if (!lastInput) return;
+        let built: HealthReport | null = null;
         try {
           const owed = pendingStats;
           const { report } = buildHealth(lastInput, owed !== null);
           if (report) {
             if (owed) {
               pendingStats = null;
+              lastCountedSig = sigOf(lastInput);
               noteBuildStats(owed);
             }
-            keepAlive(sendHealth(report));
+            built = report;
           }
         } catch {
           bumpDropped('health');
         }
+        if (built) keepAlive(sendHealth(built));
       }, heartbeatMs);
       heartbeatTimer.unref?.();
     }
