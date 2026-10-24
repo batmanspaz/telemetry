@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   HealthReportSchema,
   AnalyticsEventSchema,
@@ -239,13 +239,18 @@ describe('delta-review fixes', () => {
   it('trimmed-check count is NOT re-added by heartbeats', async () => {
     const sent: any[] = [];
     const tx: Transport = { async send(_p, b) { sent.push(b); } };
-    let nowMs = 0;
-    const t = createTelemetry({ ...cfg, transport: tx, now: () => nowMs, heartbeatMs: 1000, autoStart: true });
-    await t.reportHealth({ status: 'ok', checks: Array.from({ length: 52 }, (_, i) => ({ id: `c${i}`, status: 'pass' as const })) });
-    expect(t.counters.dropped).toBe(3);
-    await new Promise((r) => setTimeout(r, 3300));
-    t.stop();
-    expect(t.counters.dropped).toBe(3);
+    vi.useFakeTimers();
+    try {
+      const t = createTelemetry({ ...cfg, transport: tx, heartbeatMs: 1000, autoStart: true });
+      await t.reportHealth({ status: 'ok', checks: Array.from({ length: 52 }, (_, i) => ({ id: `c${i}`, status: 'pass' as const })) });
+      expect(t.counters.dropped).toBe(3);
+      await vi.advanceTimersByTimeAsync(3500);
+      t.stop();
+      expect(sent.length).toBeGreaterThan(1); // heartbeats really fired
+      expect(t.counters.dropped).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
   it('one over-cap check drops only that check, report still sent', async () => {
     const sent: any[] = [];
@@ -266,5 +271,21 @@ describe('delta-review fixes', () => {
     const out = truncateDetail(s, 100);
     expect(out.length).toBeLessThanOrEqual(100);
     expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(out)).toBe(false);
+  });
+});
+
+describe('clamp instead of dropping the whole report', () => {
+  const cfg = { product: 'billing', module: 'payments', version: 'v', autoStart: false as const };
+  it('clamps caller ttl_seconds, version and instance; report still sent; health_clamped counted once', async () => {
+    const sent: any[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    const t = createTelemetry({ ...cfg, transport: tx });
+    await t.reportHealth({ status: 'ok', ttl_seconds: CAP.ttl * 2, version: 'v'.repeat(300), instance: 'i'.repeat(300) });
+    expect(sent.length).toBe(1);
+    expect(sent[0].ttl_seconds).toBe(CAP.ttl);
+    expect(sent[0].version.length).toBe(256);
+    expect(sent[0].instance.length).toBe(256);
+    expect(t.counters.health_dropped).toBe(0);
+    expect(t.counters.health_clamped).toBe(3);
   });
 });

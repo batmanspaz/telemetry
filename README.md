@@ -194,7 +194,7 @@ observable, never a silent hang or a silent swallow.
 `keepAlive registered synchronously on reportHealth/flush + internal heartbeat/batch sends`.
 
 ```bash
-pnpm test   # 152 tests green
+pnpm test   # 153 tests green
 ```
 
 No secrets in code — the HMAC key is sourced from config/env at runtime.
@@ -214,3 +214,7 @@ analytics chunks are split by count (1000) AND bytes (~1 MiB). Every other over-
 identifiers, prop string/keys, ttl > 30 d) is DROPPED and counted in `telemetry.dropped`.
 **Upgrading to 0.7.0 is itself enforcement for anything importing these schemas** (e.g. hx-analytics
 imports `AnalyticsBatchSchema`): servers must stay on the old pin during the LIMITS_MODE=shadow soak.
+
+Also: caller-supplied `ttl_seconds` > 30 d and `version`/`instance` > 256 chars are CLAMPED (report still sent) and
+counted in `counters.health_clamped`. Re-sending the same invalid/trimmed check re-counts it on each fresh
+`reportHealth()` call (heartbeats of the same input do not re-count).

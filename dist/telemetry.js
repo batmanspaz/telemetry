@@ -30,6 +30,7 @@ export function createTelemetry(config) {
         events_dropped: 0,
         events_deduped: 0,
         health_suppressed: 0,
+        health_clamped: 0,
         dropped: 0,
     };
     let lastInput = null;
@@ -133,17 +134,36 @@ export function createTelemetry(config) {
             metric: counters.dropped,
             unit: 'count',
         });
+        // Clamp (never drop the report) caller-supplied values that exceed the wire caps.
+        let clamped = 0;
+        const clampStr = (v) => {
+            if (typeof v === 'string' && v.length > LIMITS.identifier) {
+                clamped++;
+                const c = v.charCodeAt(LIMITS.identifier - 1);
+                return v.slice(0, c >= 0xd800 && c <= 0xdbff ? LIMITS.identifier - 1 : LIMITS.identifier);
+            }
+            return v;
+        };
+        let ttl = input.ttl_seconds ?? ttlSeconds;
+        if (ttl > LIMITS.ttlSeconds) {
+            ttl = LIMITS.ttlSeconds;
+            clamped++;
+        }
+        const clInstance = clampStr(input.instance ?? config.instance);
+        const clVersion = clampStr(input.version ?? config.version);
+        if (countDrops && clamped > 0)
+            counters.health_clamped += clamped;
         const candidate = {
             schema_version: SCHEMA_VERSION,
             product: config.product,
             module: config.module,
-            instance: input.instance ?? config.instance,
+            instance: clInstance,
             status: input.status,
             score: input.score,
             checks,
-            version: input.version ?? config.version,
+            version: clVersion,
             ts: isoNow(),
-            ttl_seconds: input.ttl_seconds ?? ttlSeconds,
+            ttl_seconds: ttl,
         };
         const parsed = HealthReportSchema.safeParse(candidate);
         if (!parsed.success) {

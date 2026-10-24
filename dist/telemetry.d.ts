@@ -121,6 +121,8 @@ export interface Counters {
      *  send" and "we chose not to send" stay distinguishable — the distinction InTake needed on
      *  2026-08-17 and could not get. */
     health_suppressed: number;
+    /** Caller-supplied ttl_seconds/version/instance clamped to the wire caps (report still sent). */
+    health_clamped: number;
     /** telemetry.dropped rollup (health + events) surfaced as a health check. */
     dropped: number;
 }
