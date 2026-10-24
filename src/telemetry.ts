@@ -1,5 +1,6 @@
 import {
   HealthReportSchema,
+  HealthCheckSchema,
   AnalyticsEventSchema,
   SCHEMA_VERSION,
   type HealthReport,
@@ -143,6 +144,9 @@ export interface Counters {
   health_suppressed: number;
   /** Caller-supplied ttl_seconds/version/instance clamped to the wire caps (report still sent). */
   health_clamped: number;
+  /** Health checks dropped individually (schema-invalid) or trimmed over the checks cap, counted on the
+   *  SEND path only (also included in `dropped`). */
+  health_trimmed: number;
   /** telemetry.dropped rollup (health + events) surfaced as a health check. */
   dropped: number;
 }
@@ -199,7 +203,28 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   const batchSize = config.batchSize ?? 20;
   const batchIntervalMs = config.batchIntervalMs ?? 5_000;
   const maxBufferedEvents = config.maxBufferedEvents ?? 1_000;
-  const ttlSeconds = config.ttlSeconds ?? Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
+  // Caller-supplied config values are sanitised ONCE here (not per call): a bad value is clamped
+  // to the wire caps/default instead of making every report fail schema validation.
+  let configClamped = 0;
+  const clampIdent = (v: string | undefined): string | undefined => {
+    if (typeof v === 'string' && v.length > LIMITS.identifier) {
+      configClamped++;
+      const c = v.charCodeAt(LIMITS.identifier - 1);
+      return v.slice(0, c >= 0xd800 && c <= 0xdbff ? LIMITS.identifier - 1 : LIMITS.identifier);
+    }
+    return v;
+  };
+  const defaultTtl = Math.max(90, Math.ceil((heartbeatMs / 1000) * 2));
+  let ttlSeconds = config.ttlSeconds ?? defaultTtl;
+  if (typeof ttlSeconds !== 'number' || !Number.isInteger(ttlSeconds) || ttlSeconds <= 0) {
+    ttlSeconds = defaultTtl;
+    configClamped++;
+  } else if (ttlSeconds > LIMITS.ttlSeconds) {
+    ttlSeconds = LIMITS.ttlSeconds;
+    configClamped++;
+  }
+  const cfgVersion = clampIdent(config.version) as string;
+  const cfgInstance = clampIdent(config.instance);
   const forceResendMs = config.forceResendMs ?? Math.floor((ttlSeconds * 1000) / 2);
   const autoStart = config.autoStart ?? true;
   const keepAlive = config.keepAlive ?? (() => {});
@@ -212,7 +237,8 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     events_dropped: 0,
     events_deduped: 0,
     health_suppressed: 0,
-    health_clamped: 0,
+    health_clamped: configClamped,
+    health_trimmed: 0,
     dropped: 0,
   };
 
@@ -225,6 +251,13 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   let lastSentChecksKey: string | null = null;
 
   const onWarn = config.onWarn;
+  if (configClamped > 0 && onWarn) {
+    try {
+      onWarn(`[telemetry] ${config.product}/${config.module}: clamped ${configClamped} config value(s) (version/instance/ttlSeconds) to the wire caps.`);
+    } catch {
+      /* hook failure must never break the client */
+    }
+  }
   const onTransportError = config.onTransportError;
 
   /** Invokes onTransportError defensively — a hook that itself throws (or, if async, rejects)
@@ -261,7 +294,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   }
 
   const checksKey = (checks?: HealthCheck[]): string =>
-    JSON.stringify((checks ?? []).map((c) => [c.id, c.status]).sort());
+    JSON.stringify((Array.isArray(checks) ? checks : []).map((c) => [c?.id, c?.status]).sort());
 
   // Buffer holds fully-validated AnalyticsEvent objects (each already carries its
   // own dedupe_key) — the wire body is this array, verbatim, with no envelope.
@@ -290,29 +323,34 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     return new TextEncoder().encode(str).length;
   }
 
-  function buildHealth(input: HealthInput, countDrops = false): HealthReport | null {
-    // Over-long detail is truncated (with a marker), never grounds to drop the whole report.
-    // One slot is reserved for the auto `telemetry.dropped` check below; checks beyond
-    // the cap are trimmed (and counted) rather than dropping the whole report.
-    // A single invalid check (id empty/>256, unit >32) is dropped on its own, never the
-    // whole report. Drops are counted only when countDrops (a fresh reportHealth call):
-    // heartbeats rebuild from lastInput and must not re-count the same trimmed checks.
-    let userChecks = (input.checks ?? []).filter(
-      (c) =>
-        typeof c.id === 'string' && c.id.length >= 1 && c.id.length <= LIMITS.checkId &&
-        (c.unit === undefined || (typeof c.unit === 'string' && c.unit.length <= LIMITS.checkUnit)),
-    );
-    let trimmed = (input.checks?.length ?? 0) - userChecks.length;
-    if (userChecks.length > LIMITS.checks - 1) {
-      trimmed += userChecks.length - (LIMITS.checks - 1);
-      userChecks = userChecks.slice(0, LIMITS.checks - 1);
+  interface BuildStats { trimmed: number; clamped: number }
+
+  /** Pure builder: never touches counters. The caller counts `stats` only if the report is
+   *  actually SENT (a debounce-suppressed call must not inflate them). */
+  function buildHealth(input: HealthInput, pending = false): { report: HealthReport | null; stats: BuildStats } {
+    const stats: BuildStats = { trimmed: 0, clamped: 0 };
+    const rawChecks = Array.isArray(input.checks) ? input.checks : [];
+    // Truncate over-long detail first (never grounds to drop), then validate EACH check against
+    // the wire schema: one invalid check (bad status/unit/id, non-string detail, extra key) is
+    // dropped on its own, never the whole report.
+    const truncAt = (c: HealthCheck, cap: number): HealthCheck =>
+      c && typeof c === 'object' && typeof c.detail === 'string' && c.detail.length > cap
+        ? { ...c, detail: truncateDetail(c.detail, cap) }
+        : c;
+    let valid: HealthCheck[] = [];
+    for (const c of rawChecks) {
+      const r = HealthCheckSchema.safeParse(truncAt(c, LIMITS.checkDetail));
+      if (r.success) valid.push(r.data);
+      else stats.trimmed++;
     }
-    if (countDrops && trimmed > 0) counters.dropped += trimmed;
+    // One slot is reserved for the auto `telemetry.dropped` check below; checks beyond the cap
+    // are trimmed (and counted) rather than dropping the whole report.
+    if (valid.length > LIMITS.checks - 1) {
+      stats.trimmed += valid.length - (LIMITS.checks - 1);
+      valid = valid.slice(0, LIMITS.checks - 1);
+    }
     let detailCap: number = LIMITS.checkDetail;
-    const shape = (cap: number): HealthCheck[] =>
-      userChecks.map((c) =>
-        typeof c.detail === 'string' && c.detail.length > cap ? { ...c, detail: truncateDetail(c.detail, cap) } : c,
-      );
+    const shape = (cap: number): HealthCheck[] => valid.map((c) => truncAt(c, cap));
     let checks = shape(detailCap);
     // The server also caps the request body (32 KiB on hx-health-ingest): shrink detail
     // budgets until the checks fit, so truncation actually guarantees delivery.
@@ -320,33 +358,52 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       detailCap = Math.floor(detailCap / 2);
       checks = shape(detailCap);
     }
-    // Self-report the dropped-emission counter so the observability layer can't
-    // fail silently — a non-zero drop count shows up as a warn check.
-    checks.push({
-      id: 'telemetry.dropped',
-      status: counters.dropped > 0 ? 'warn' : 'pass',
-      metric: counters.dropped,
-      unit: 'count',
-    });
 
-    // Clamp (never drop the report) caller-supplied values that exceed the wire caps.
-    let clamped = 0;
+    // Clamp (never drop the report) caller-supplied per-call values that violate the wire caps.
     const clampStr = (v: string | undefined): string | undefined => {
       if (typeof v === 'string' && v.length > LIMITS.identifier) {
-        clamped++;
+        stats.clamped++;
         const c = v.charCodeAt(LIMITS.identifier - 1);
         return v.slice(0, c >= 0xd800 && c <= 0xdbff ? LIMITS.identifier - 1 : LIMITS.identifier);
       }
       return v;
     };
     let ttl = input.ttl_seconds ?? ttlSeconds;
-    if (ttl > LIMITS.ttlSeconds) {
+    if (typeof ttl !== 'number' || !Number.isInteger(ttl) || ttl <= 0) {
+      ttl = ttlSeconds; // NaN / Infinity / float / <=0 -> the (already sanitised) default
+      stats.clamped++;
+    } else if (ttl > LIMITS.ttlSeconds) {
       ttl = LIMITS.ttlSeconds;
-      clamped++;
+      stats.clamped++;
     }
-    const clInstance = clampStr(input.instance ?? config.instance);
-    const clVersion = clampStr(input.version ?? config.version);
-    if (countDrops && clamped > 0) counters.health_clamped += clamped;
+    const clInstance = input.instance !== undefined ? clampStr(input.instance) : cfgInstance;
+    const clVersion = input.version !== undefined ? clampStr(input.version) : cfgVersion;
+
+    // Self-report the dropped-emission counter so the observability layer can't
+    // fail silently — a non-zero drop count shows up as a warn check.
+    // `pending` = this build is a fresh reportHealth that will be counted if sent; heartbeat
+    // rebuilds (pending=false) were already counted, so their stats must not be added again.
+    const addT = pending ? stats.trimmed : 0;
+    const addC = pending ? stats.clamped : 0;
+    checks.push({
+      id: 'telemetry.dropped',
+      status: counters.dropped + addT > 0 ? 'warn' : 'pass',
+      metric: counters.dropped + addT,
+      unit: 'count',
+    });
+    // Self-report clamps/trims so the health platform sees them (not only a local counter).
+    // Appended only when there is room: user checks are never evicted for it.
+    const clampedTotal = counters.health_clamped + addC;
+    const trimmedTotal = counters.health_trimmed + addT;
+    if ((clampedTotal > 0 || trimmedTotal > 0) && checks.length < LIMITS.checks) {
+      checks.push({
+        id: 'telemetry.clamped',
+        status: 'warn',
+        metric: clampedTotal,
+        unit: 'count',
+        detail: `clamped ${clampedTotal} caller value(s) to wire caps; trimmed ${trimmedTotal} check(s)`,
+      });
+    }
 
     const candidate = {
       schema_version: SCHEMA_VERSION,
@@ -364,9 +421,28 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     const parsed = HealthReportSchema.safeParse(candidate);
     if (!parsed.success) {
       bumpDropped('health');
-      return null;
+      return { report: null, stats };
     }
-    return parsed.data;
+    return { report: parsed.data, stats };
+  }
+
+  /** Count + warn about a fresh report's clamps/trims; called only on the SEND path. */
+  function noteBuildStats(stats: BuildStats): void {
+    if (stats.trimmed > 0) {
+      counters.dropped += stats.trimmed;
+      counters.health_trimmed += stats.trimmed;
+    }
+    if (stats.clamped > 0) counters.health_clamped += stats.clamped;
+    if ((stats.trimmed > 0 || stats.clamped > 0) && onWarn) {
+      try {
+        onWarn(
+          `[telemetry] health report for ${config.product}/${config.module}: clamped ${stats.clamped} ` +
+            `caller value(s) and trimmed ${stats.trimmed} check(s) to fit the wire caps.`,
+        );
+      } catch {
+        /* hook failure must never break the client */
+      }
+    }
   }
 
   async function sendHealth(report: HealthReport): Promise<void> {
@@ -384,7 +460,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   async function doReportHealth(input: HealthInput): Promise<void> {
     try {
       lastInput = input;
-      const report = buildHealth(input, true);
+      const { report, stats } = buildHealth(input, true);
       if (!report) return;
       // Emit immediately on a status change (debounced vs the last sent status).
       // Also force a resend once forceResendMs has elapsed since the last send,
@@ -396,6 +472,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       const elapsedSinceSend = lastSentAtMs === null ? Infinity : now() - lastSentAtMs;
       const forceDue = forceResendMs > 0 && elapsedSinceSend >= forceResendMs;
       if (statusChanged || forceDue) {
+        noteBuildStats(stats);
         await sendHealth(report);
         lastSentChecksKey = checksKey(input.checks);
         return;
@@ -553,7 +630,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     if (heartbeatMs > 0 && !heartbeatTimer) {
       heartbeatTimer = setInterval(() => {
         if (!lastInput) return;
-        const report = buildHealth(lastInput);
+        const { report } = buildHealth(lastInput);
         if (report) keepAlive(sendHealth(report));
       }, heartbeatMs);
       heartbeatTimer.unref?.();
