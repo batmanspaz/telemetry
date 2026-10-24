@@ -34,6 +34,7 @@ export const TRUNCATION_MARKER = '...[truncated]';
 /** Truncate `s` to at most `max` chars, ending in a visible marker when cut. */
 export function truncateDetail(s: string, max: number = LIMITS.checkDetail): string {
   if (s.length <= max) return s;
+  if (max <= TRUNCATION_MARKER.length) return s.slice(0, Math.max(0, max));
   return s.slice(0, max - TRUNCATION_MARKER.length) + TRUNCATION_MARKER;
 }
 

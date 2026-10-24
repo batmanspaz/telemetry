@@ -188,3 +188,46 @@ describe('parseLimitsMode', () => {
     expect(LIMITS.analyticsBodyBytes).toBe(1_048_576);
   });
 });
+
+describe('review fixes', () => {
+  const cfg = { product: 'billing', module: 'payments', version: 'v', autoStart: false as const };
+  it('reportHealth with exactly LIMITS.checks user checks still sends (slot reserved)', async () => {
+    const sent: any[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    const t = createTelemetry({ ...cfg, transport: tx });
+    await t.reportHealth({ status: 'ok', checks: Array.from({ length: 50 }, (_, i) => ({ id: `c${i}`, status: 'pass' as const })) });
+    expect(sent.length).toBe(1);
+    expect(sent[0].checks.length).toBe(50);
+    expect(t.counters.health_dropped).toBe(0);
+  });
+  it('shrinks detail so the health body fits 32 KiB', async () => {
+    const sent: any[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    const t = createTelemetry({ ...cfg, transport: tx });
+    await t.reportHealth({ status: 'ok', checks: Array.from({ length: 10 }, (_, i) => ({ id: `c${i}`, status: 'pass' as const, detail: 'x'.repeat(16000) })) });
+    expect(sent.length).toBe(1);
+    expect(JSON.stringify(sent[0]).length).toBeLessThanOrEqual(LIMITS.healthBodyBytes);
+  });
+  it('splits analytics chunks by bytes (1 MiB body cap)', async () => {
+    const bytes: number[] = [];
+    const tx: Transport = { async send(_p, b) { bytes.push(JSON.stringify(b).length); } };
+    const t = createTelemetry({ ...cfg, transport: tx, batchSize: 100_000, batchIntervalMs: 0, maxBufferedEvents: 5000 });
+    for (let i = 0; i < 600; i++) t.track({ event: 'invoice.created', key: `k${i}`, props: { a: 's'.repeat(1000), b: 's'.repeat(1000) } });
+    await t.flush();
+    expect(Math.max(...bytes)).toBeLessThanOrEqual(LIMITS.analyticsBodyBytes);
+    expect(bytes.length).toBeGreaterThan(1);
+  });
+  it('concurrent flushes join one loop (no reordering)', async () => {
+    let inFlight = 0, maxInFlight = 0;
+    const tx: Transport = { async send() { inFlight++; maxInFlight = Math.max(maxInFlight, inFlight); await new Promise((r) => setTimeout(r, 5)); inFlight--; } };
+    const t = createTelemetry({ ...cfg, transport: tx, batchSize: 100_000, batchIntervalMs: 0, maxBufferedEvents: 5000 });
+    for (let i = 0; i < 2500; i++) t.track({ event: 'invoice.created', key: `k${i}` });
+    await Promise.all([t.flush(), t.flush(), t.flush()]);
+    expect(maxInFlight).toBe(1);
+    expect(t.counters.events_sent).toBe(2500);
+  });
+  it('truncateDetail clamps tiny max', () => {
+    expect(truncateDetail('x'.repeat(100), 5).length).toBe(5);
+    expect(truncateDetail('x'.repeat(100), 0)).toBe('');
+  });
+});

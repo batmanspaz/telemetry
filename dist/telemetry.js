@@ -97,13 +97,27 @@ export function createTelemetry(config) {
     function isoNow() {
         return new Date(now()).toISOString();
     }
+    function byteLen(str) {
+        return new TextEncoder().encode(str).length;
+    }
     function buildHealth(input) {
         // Over-long detail is truncated (with a marker), never grounds to drop the whole report.
-        const checks = input.checks
-            ? input.checks.map((c) => typeof c.detail === 'string' && c.detail.length > LIMITS.checkDetail
-                ? { ...c, detail: truncateDetail(c.detail) }
-                : c)
-            : [];
+        // One slot is reserved for the auto `telemetry.dropped` check below; checks beyond
+        // the cap are trimmed (and counted) rather than dropping the whole report.
+        let userChecks = input.checks ?? [];
+        if (userChecks.length > LIMITS.checks - 1) {
+            counters.dropped += userChecks.length - (LIMITS.checks - 1);
+            userChecks = userChecks.slice(0, LIMITS.checks - 1);
+        }
+        let detailCap = LIMITS.checkDetail;
+        const shape = (cap) => userChecks.map((c) => typeof c.detail === 'string' && c.detail.length > cap ? { ...c, detail: truncateDetail(c.detail, cap) } : c);
+        let checks = shape(detailCap);
+        // The server also caps the request body (32 KiB on hx-health-ingest): shrink detail
+        // budgets until the checks fit, so truncation actually guarantees delivery.
+        while (detailCap > 64 && byteLen(JSON.stringify(checks)) > LIMITS.healthBodyBytes - 2048) {
+            detailCap = Math.floor(detailCap / 2);
+            checks = shape(detailCap);
+        }
         // Self-report the dropped-emission counter so the observability layer can't
         // fail silently — a non-zero drop count shows up as a warn check.
         checks.push({
@@ -243,14 +257,31 @@ export function createTelemetry(config) {
             bumpDropped('event');
         }
     }
-    async function doFlush() {
+    let flushing = null;
+    // Serialized: a second flush while one is in flight joins it (the running loop drains
+    // newly tracked events too), so a failed chunk can never be requeued behind later sends.
+    function doFlush() {
+        if (flushing)
+            return flushing;
+        flushing = flushLoop().finally(() => {
+            flushing = null;
+        });
+        return flushing;
+    }
+    async function flushLoop() {
         if (buffer.length === 0)
             return;
         lastFlushAtMs = now();
         // Chunk to the server's batch cap: a request over LIMITS.batch is rejected whole
         // (data loss), so a large maxBufferedEvents must never become one giant request.
         while (buffer.length > 0) {
-            const batch = buffer.splice(0, Math.min(buffer.length, LIMITS.batch));
+            let n = Math.min(buffer.length, LIMITS.batch);
+            // Byte-aware: halve until the serialized chunk fits the server's body cap (1 MiB,
+            // with headroom). A single event is always sent as-is (props caps bound it).
+            while (n > 1 && byteLen(JSON.stringify(buffer.slice(0, n))) > LIMITS.analyticsBodyBytes - 4096) {
+                n = Math.floor(n / 2);
+            }
+            const batch = buffer.splice(0, n);
             try {
                 // The wire body is a bare array of events — matches the server's
                 // AnalyticsBatch schema exactly (no wrapping envelope).

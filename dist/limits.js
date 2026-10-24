@@ -33,6 +33,8 @@ export const TRUNCATION_MARKER = '...[truncated]';
 export function truncateDetail(s, max = LIMITS.checkDetail) {
     if (s.length <= max)
         return s;
+    if (max <= TRUNCATION_MARKER.length)
+        return s.slice(0, Math.max(0, max));
     return s.slice(0, max - TRUNCATION_MARKER.length) + TRUNCATION_MARKER;
 }
 /** Parse the LIMITS_MODE env var; anything unknown/unset falls back to 'shadow'. */
