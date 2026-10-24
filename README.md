@@ -194,7 +194,7 @@ observable, never a silent hang or a silent swallow.
 `keepAlive registered synchronously on reportHealth/flush + internal heartbeat/batch sends`.
 
 ```bash
-pnpm test   # 144 tests green
+pnpm test   # 152 tests green
 ```
 
 No secrets in code — the HMAC key is sourced from config/env at runtime.

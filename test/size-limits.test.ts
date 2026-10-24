@@ -198,6 +198,8 @@ describe('review fixes', () => {
     await t.reportHealth({ status: 'ok', checks: Array.from({ length: 50 }, (_, i) => ({ id: `c${i}`, status: 'pass' as const })) });
     expect(sent.length).toBe(1);
     expect(sent[0].checks.length).toBe(50);
+    expect(sent[0].checks.some((c: any) => c.id === 'c49')).toBe(false); // 50th user check dropped
+    expect(t.counters.dropped).toBe(1);
     expect(t.counters.health_dropped).toBe(0);
   });
   it('shrinks detail so the health body fits 32 KiB', async () => {
@@ -229,5 +231,40 @@ describe('review fixes', () => {
   it('truncateDetail clamps tiny max', () => {
     expect(truncateDetail('x'.repeat(100), 5).length).toBe(5);
     expect(truncateDetail('x'.repeat(100), 0)).toBe('');
+  });
+});
+
+describe('delta-review fixes', () => {
+  const cfg = { product: 'billing', module: 'payments', version: 'v', autoStart: false as const };
+  it('trimmed-check count is NOT re-added by heartbeats', async () => {
+    const sent: any[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    let nowMs = 0;
+    const t = createTelemetry({ ...cfg, transport: tx, now: () => nowMs, heartbeatMs: 1000, autoStart: true });
+    await t.reportHealth({ status: 'ok', checks: Array.from({ length: 52 }, (_, i) => ({ id: `c${i}`, status: 'pass' as const })) });
+    expect(t.counters.dropped).toBe(3);
+    await new Promise((r) => setTimeout(r, 3300));
+    t.stop();
+    expect(t.counters.dropped).toBe(3);
+  });
+  it('one over-cap check drops only that check, report still sent', async () => {
+    const sent: any[] = [];
+    const tx: Transport = { async send(_p, b) { sent.push(b); } };
+    const t = createTelemetry({ ...cfg, transport: tx });
+    await t.reportHealth({ status: 'ok', checks: [
+      { id: 'ok1', status: 'pass' },
+      { id: 'x'.repeat(257), status: 'pass' },
+      { id: 'badunit', status: 'pass', unit: 'u'.repeat(33) },
+    ] });
+    expect(sent.length).toBe(1);
+    expect(sent[0].checks.map((c: any) => c.id)).toEqual(['ok1', 'telemetry.dropped']);
+    expect(t.counters.dropped).toBe(2);
+    expect(t.counters.health_dropped).toBe(0);
+  });
+  it('truncateDetail never leaves a lone high surrogate', () => {
+    const s = 'a'.repeat(100 - 14 - 1) + '\u{1F600}' + 'z'.repeat(50);
+    const out = truncateDetail(s, 100);
+    expect(out.length).toBeLessThanOrEqual(100);
+    expect(/[\ud800-\udbff](?![\udc00-\udfff])/.test(out)).toBe(false);
   });
 });

@@ -35,7 +35,10 @@ export const TRUNCATION_MARKER = '...[truncated]';
 export function truncateDetail(s: string, max: number = LIMITS.checkDetail): string {
   if (s.length <= max) return s;
   if (max <= TRUNCATION_MARKER.length) return s.slice(0, Math.max(0, max));
-  return s.slice(0, max - TRUNCATION_MARKER.length) + TRUNCATION_MARKER;
+  let cut = max - TRUNCATION_MARKER.length;
+  const c = s.charCodeAt(cut - 1);
+  if (c >= 0xd800 && c <= 0xdbff) cut--; // never end on a lone high surrogate
+  return s.slice(0, cut) + TRUNCATION_MARKER;
 }
 
 export type LimitsMode = 'shadow' | 'enforce' | 'off';

@@ -100,15 +100,22 @@ export function createTelemetry(config) {
     function byteLen(str) {
         return new TextEncoder().encode(str).length;
     }
-    function buildHealth(input) {
+    function buildHealth(input, countDrops = false) {
         // Over-long detail is truncated (with a marker), never grounds to drop the whole report.
         // One slot is reserved for the auto `telemetry.dropped` check below; checks beyond
         // the cap are trimmed (and counted) rather than dropping the whole report.
-        let userChecks = input.checks ?? [];
+        // A single invalid check (id empty/>256, unit >32) is dropped on its own, never the
+        // whole report. Drops are counted only when countDrops (a fresh reportHealth call):
+        // heartbeats rebuild from lastInput and must not re-count the same trimmed checks.
+        let userChecks = (input.checks ?? []).filter((c) => typeof c.id === 'string' && c.id.length >= 1 && c.id.length <= LIMITS.checkId &&
+            (c.unit === undefined || (typeof c.unit === 'string' && c.unit.length <= LIMITS.checkUnit)));
+        let trimmed = (input.checks?.length ?? 0) - userChecks.length;
         if (userChecks.length > LIMITS.checks - 1) {
-            counters.dropped += userChecks.length - (LIMITS.checks - 1);
+            trimmed += userChecks.length - (LIMITS.checks - 1);
             userChecks = userChecks.slice(0, LIMITS.checks - 1);
         }
+        if (countDrops && trimmed > 0)
+            counters.dropped += trimmed;
         let detailCap = LIMITS.checkDetail;
         const shape = (cap) => userChecks.map((c) => typeof c.detail === 'string' && c.detail.length > cap ? { ...c, detail: truncateDetail(c.detail, cap) } : c);
         let checks = shape(detailCap);
@@ -160,7 +167,7 @@ export function createTelemetry(config) {
     async function doReportHealth(input) {
         try {
             lastInput = input;
-            const report = buildHealth(input);
+            const report = buildHealth(input, true);
             if (!report)
                 return;
             // Emit immediately on a status change (debounced vs the last sent status).
