@@ -8,6 +8,7 @@ import {
   type AnalyticsEvent,
   type PropValue,
 } from './schema.js';
+import { LIMITS, truncateDetail } from './limits.js';
 import { hash } from './hash.js';
 import { scanForPii } from './pii.js';
 import { noopTransport, type Transport } from './transport.js';
@@ -140,6 +141,8 @@ export interface Counters {
    *  send" and "we chose not to send" stay distinguishable — the distinction InTake needed on
    *  2026-08-17 and could not get. */
   health_suppressed: number;
+  /** Caller-supplied ttl_seconds/version/instance clamped to the wire caps (report still sent). */
+  health_clamped: number;
   /** telemetry.dropped rollup (health + events) surfaced as a health check. */
   dropped: number;
 }
@@ -209,6 +212,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     events_dropped: 0,
     events_deduped: 0,
     health_suppressed: 0,
+    health_clamped: 0,
     dropped: 0,
   };
 
@@ -282,8 +286,40 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     return new Date(now()).toISOString();
   }
 
-  function buildHealth(input: HealthInput): HealthReport | null {
-    const checks: HealthCheck[] = input.checks ? [...input.checks] : [];
+  function byteLen(str: string): number {
+    return new TextEncoder().encode(str).length;
+  }
+
+  function buildHealth(input: HealthInput, countDrops = false): HealthReport | null {
+    // Over-long detail is truncated (with a marker), never grounds to drop the whole report.
+    // One slot is reserved for the auto `telemetry.dropped` check below; checks beyond
+    // the cap are trimmed (and counted) rather than dropping the whole report.
+    // A single invalid check (id empty/>256, unit >32) is dropped on its own, never the
+    // whole report. Drops are counted only when countDrops (a fresh reportHealth call):
+    // heartbeats rebuild from lastInput and must not re-count the same trimmed checks.
+    let userChecks = (input.checks ?? []).filter(
+      (c) =>
+        typeof c.id === 'string' && c.id.length >= 1 && c.id.length <= LIMITS.checkId &&
+        (c.unit === undefined || (typeof c.unit === 'string' && c.unit.length <= LIMITS.checkUnit)),
+    );
+    let trimmed = (input.checks?.length ?? 0) - userChecks.length;
+    if (userChecks.length > LIMITS.checks - 1) {
+      trimmed += userChecks.length - (LIMITS.checks - 1);
+      userChecks = userChecks.slice(0, LIMITS.checks - 1);
+    }
+    if (countDrops && trimmed > 0) counters.dropped += trimmed;
+    let detailCap: number = LIMITS.checkDetail;
+    const shape = (cap: number): HealthCheck[] =>
+      userChecks.map((c) =>
+        typeof c.detail === 'string' && c.detail.length > cap ? { ...c, detail: truncateDetail(c.detail, cap) } : c,
+      );
+    let checks = shape(detailCap);
+    // The server also caps the request body (32 KiB on hx-health-ingest): shrink detail
+    // budgets until the checks fit, so truncation actually guarantees delivery.
+    while (detailCap > 64 && byteLen(JSON.stringify(checks)) > LIMITS.healthBodyBytes - 2048) {
+      detailCap = Math.floor(detailCap / 2);
+      checks = shape(detailCap);
+    }
     // Self-report the dropped-emission counter so the observability layer can't
     // fail silently — a non-zero drop count shows up as a warn check.
     checks.push({
@@ -293,17 +329,36 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
       unit: 'count',
     });
 
+    // Clamp (never drop the report) caller-supplied values that exceed the wire caps.
+    let clamped = 0;
+    const clampStr = (v: string | undefined): string | undefined => {
+      if (typeof v === 'string' && v.length > LIMITS.identifier) {
+        clamped++;
+        const c = v.charCodeAt(LIMITS.identifier - 1);
+        return v.slice(0, c >= 0xd800 && c <= 0xdbff ? LIMITS.identifier - 1 : LIMITS.identifier);
+      }
+      return v;
+    };
+    let ttl = input.ttl_seconds ?? ttlSeconds;
+    if (ttl > LIMITS.ttlSeconds) {
+      ttl = LIMITS.ttlSeconds;
+      clamped++;
+    }
+    const clInstance = clampStr(input.instance ?? config.instance);
+    const clVersion = clampStr(input.version ?? config.version);
+    if (countDrops && clamped > 0) counters.health_clamped += clamped;
+
     const candidate = {
       schema_version: SCHEMA_VERSION,
       product: config.product,
       module: config.module,
-      instance: input.instance ?? config.instance,
+      instance: clInstance,
       status: input.status,
       score: input.score,
       checks,
-      version: input.version ?? config.version,
+      version: clVersion,
       ts: isoNow(),
-      ttl_seconds: input.ttl_seconds ?? ttlSeconds,
+      ttl_seconds: ttl,
     };
 
     const parsed = HealthReportSchema.safeParse(candidate);
@@ -329,7 +384,7 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
   async function doReportHealth(input: HealthInput): Promise<void> {
     try {
       lastInput = input;
-      const report = buildHealth(input);
+      const report = buildHealth(input, true);
       if (!report) return;
       // Emit immediately on a status change (debounced vs the last sent status).
       // Also force a resend once forceResendMs has elapsed since the last send,
@@ -434,23 +489,46 @@ export function createTelemetry(config: TelemetryConfig): Telemetry {
     }
   }
 
-  async function doFlush(): Promise<void> {
+  let flushing: Promise<void> | null = null;
+  // Serialized: a second flush while one is in flight joins it (the running loop drains
+  // newly tracked events too), so a failed chunk can never be requeued behind later sends.
+  function doFlush(): Promise<void> {
+    if (flushing) return flushing;
+    flushing = flushLoop().finally(() => {
+      flushing = null;
+    });
+    return flushing;
+  }
+
+  async function flushLoop(): Promise<void> {
     if (buffer.length === 0) return;
     lastFlushAtMs = now();
-    const batch = buffer.splice(0, buffer.length);
-    try {
-      // The wire body is a bare array of events — matches the server's
-      // AnalyticsBatch schema exactly (no wrapping envelope).
-      await transport.send(ANALYTICS_PATH, batch);
-      counters.events_sent += batch.length;
-    } catch (error) {
-      // Requeue (keys stay in seenKeys, so no re-buffering) and count the drop.
-      // Each event's own dedupe_key means the eventual successful send is
-      // idempotent downstream even after a retried batch.
-      buffer.unshift(...batch);
-      bumpDropped('event', batch.length);
-      trimBufferToCap();
-      reportTransportError({ kind: 'event', path: ANALYTICS_PATH, error, count: batch.length });
+    // Chunk to the server's batch cap: a request over LIMITS.batch is rejected whole
+    // (data loss), so a large maxBufferedEvents must never become one giant request.
+    while (buffer.length > 0) {
+      let n = Math.min(buffer.length, LIMITS.batch);
+      // Byte-aware: halve until the serialized chunk fits the server's body cap (1 MiB,
+      // with headroom). A single event is always sent as-is (props caps bound it).
+      while (n > 1 && byteLen(JSON.stringify(buffer.slice(0, n))) > LIMITS.analyticsBodyBytes - 4096) {
+        n = Math.floor(n / 2);
+      }
+      const batch = buffer.splice(0, n);
+      try {
+        // The wire body is a bare array of events — matches the server's
+        // AnalyticsBatch schema exactly (no wrapping envelope).
+        await transport.send(ANALYTICS_PATH, batch);
+        counters.events_sent += batch.length;
+      } catch (error) {
+        // Requeue (keys stay in seenKeys, so no re-buffering) and count the drop.
+        // Each event's own dedupe_key means the eventual successful send is
+        // idempotent downstream even after a retried batch. Stop on failure; the
+        // remaining chunks stay buffered for the next flush.
+        buffer.unshift(...batch);
+        bumpDropped('event', batch.length);
+        trimBufferToCap();
+        reportTransportError({ kind: 'event', path: ANALYTICS_PATH, error, count: batch.length });
+        return;
+      }
     }
   }
 

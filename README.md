@@ -194,7 +194,27 @@ observable, never a silent hang or a silent swallow.
 `keepAlive registered synchronously on reportHealth/flush + internal heartbeat/batch sends`.
 
 ```bash
-pnpm test   # 78 tests green
+pnpm test   # 153 tests green
 ```
 
 No secrets in code — the HMAC key is sourced from config/env at runtime.
+
+## Size limits (v0.7.0)
+
+Wire caps live in `src/limits.ts` (`LIMITS`): batch 1000 events, 50 checks, 128 prop keys (key 128 chars,
+string value 1024), check id 256 / unit 32 / detail 16384, identifiers 256, event name 128, ttl 30 days.
+The client truncates over-long check `detail` (marker `...[truncated]`) instead of dropping the report,
+and `flush()` chunks to the batch cap. Ingest Workers enforce the same numbers behind
+`LIMITS_MODE=shadow|enforce|off` (default `shadow`; see `parseLimitsMode`) and emit
+`ingest.limit_violation{field,platform,product}`.
+
+Client behaviour at the caps: check `detail` is truncated (and shrunk further so the whole health body
+fits 32 KiB); user checks beyond 49 are trimmed (one slot is reserved for `telemetry.dropped`) and counted;
+analytics chunks are split by count (1000) AND bytes (~1 MiB). Every other over-cap field (id, unit, key,
+identifiers, prop string/keys, ttl > 30 d) is DROPPED and counted in `telemetry.dropped`.
+**Upgrading to 0.7.0 is itself enforcement for anything importing these schemas** (e.g. hx-analytics
+imports `AnalyticsBatchSchema`): servers must stay on the old pin during the LIMITS_MODE=shadow soak.
+
+Also: caller-supplied `ttl_seconds` > 30 d and `version`/`instance` > 256 chars are CLAMPED (report still sent) and
+counted in `counters.health_clamped`. Re-sending the same invalid/trimmed check re-counts it on each fresh
+`reportHealth()` call (heartbeats of the same input do not re-count).

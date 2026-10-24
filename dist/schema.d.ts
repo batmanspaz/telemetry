@@ -69,7 +69,7 @@ export declare const AnalyticsEventSchema: z.ZodObject<{
     entity_id: z.ZodOptional<z.ZodString>;
     actor: z.ZodOptional<z.ZodString>;
     session_id: z.ZodOptional<z.ZodString>;
-    props: z.ZodRecord<z.ZodString, z.ZodUnion<readonly [z.ZodString, z.ZodNumber, z.ZodBoolean]>>;
+    props: z.ZodPipe<z.ZodCustom<Record<string, unknown>, Record<string, unknown>>, z.ZodRecord<z.ZodString, z.ZodUnion<readonly [z.ZodString, z.ZodNumber, z.ZodBoolean]>>>;
     ts: z.ZodString;
     dedupe_key: z.ZodString;
 }, z.core.$strict>;
@@ -82,7 +82,7 @@ export declare const AnalyticsBatchSchema: z.ZodArray<z.ZodObject<{
     entity_id: z.ZodOptional<z.ZodString>;
     actor: z.ZodOptional<z.ZodString>;
     session_id: z.ZodOptional<z.ZodString>;
-    props: z.ZodRecord<z.ZodString, z.ZodUnion<readonly [z.ZodString, z.ZodNumber, z.ZodBoolean]>>;
+    props: z.ZodPipe<z.ZodCustom<Record<string, unknown>, Record<string, unknown>>, z.ZodRecord<z.ZodString, z.ZodUnion<readonly [z.ZodString, z.ZodNumber, z.ZodBoolean]>>>;
     ts: z.ZodString;
     dedupe_key: z.ZodString;
 }, z.core.$strict>>;
